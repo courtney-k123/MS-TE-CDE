@@ -1,0 +1,177 @@
+#TECDE model
+#CDE Model
+# Adapted from: https://github.com/patrick-kidger/torchcde
+import logging #used for logging messages - useful for debugging etc 
+import torch #main pytorch library which is used for tensor computations and deep learning 
+import torch.nn as nn #contains modules for building neural networks
+import torchcde #A library for Continuous Deep Equations (CDEs), which are used for modeling continuous-time dynamics with neural networks.
+from torch.nn import functional as F #Provides functions like activation functions, loss functions, etc., in a functional style (without the need for creating objects).
+
+
+######################
+# A CDE model is defined as
+#
+# z_t = z_0 + \int_0^t f_\theta(z_s) dX_s
+#
+# Where X is your data and f_\theta is a neural network. So the first thing we need to do is define such an f_\theta.
+# That's what this CDEFunc class does.
+######################
+class CDEFunc(torch.nn.Module): #This defines the CDEFunc class as a subclass of torch.nn.Module, meaning it is a neural network module
+    def __init__(self, input_channels, hidden_channels):
+        ######################
+        # input_channels is the number of input channels in the data X. (Determined by the data.)
+        # hidden_channels is the number of channels for z_t. (Determined by you!)
+        ######################
+        super(CDEFunc, self).__init__()
+        self.input_channels = input_channels #input_channels refers to the number of channels in the input data,
+        self.hidden_channels = hidden_channels #hidden_channels refers to the number of hidden units in the function that will describe the continuous dynamics
+
+        self.linear1 = torch.nn.Linear(
+            hidden_channels,
+            128,
+        )  # torch.nn.Linear(hidden_channels, hidden_channels)
+        self.linear2 = torch.nn.Linear(
+            128,
+            input_channels * hidden_channels,
+        )  # torch.nn.Linear(hidden_channels, input_channels * hidden_channels)
+        
+        #self.linear1 and self.linear2 are fully connected (linear) layers that will transform the input data
+        
+        self.W = torch.nn.Parameter(torch.Tensor(input_channels)) #self.W is a learnable parameter (a tensor), initialized to 1, which represents the weights for the input channels.
+        self.W.data.fill_(1) #currently filled with 1, until learned
+
+    def forward(self, t, z): #forward method defines the computation that happens when input z (the hidden state) is passed through the network.
+        # z has shape (batch, hidden_channels)
+        #z is passed through linear1, then through the ReLU activation, and then through linear2 to produce an output.
+        z = self.linear1(z)
+        z = z.relu()
+        z = self.linear2(z)
+
+        ######################
+        # Ignoring the batch dimension, the shape of the output tensor must be a matrix,
+        # because we need it to represent a linear map from R^input_channels to R^hidden_channels.
+        ######################
+        z = z.view(z.size(0), self.hidden_channels, self.input_channels) #The output is reshaped to have the shape (batch_size, hidden_channels, input_channels) so that it can be used in the next part of the model.
+        # z = torch.matmul(z,torch.diag(self.W))
+
+        return z #The reshaped tensor is returned, representing the function f_\theta(z_s)
+
+######################
+# Next, we need to package CDEFunc up into a model that computes the integral.
+######################
+#Your NeuralCDE class handles encoding the past time series into a latent vector z — it's your encoder / feature extractor.
+#step_forward() is your simulator or policy evaluator, which should live in a model that wraps around or extends from NeuralCDE.
+class NeuralCDE(torch.nn.Module): #NeuralCDE is a subclass of torch.nn.Module which represents the whole model. It takes input_channels_x, hidden_channels_x, and output_channels as arguments.
+    def __init__(
+        self,
+        input_channels_x,
+        hidden_channels_x,
+        output_channels,
+        interpolation="linear", #interpolation determines the method for interpolating the data between time steps (either "linear" or "cubic").
+    ):
+        super(NeuralCDE, self).__init__()
+
+        self.embed_x = torch.nn.Linear(input_channels_x, hidden_channels_x) #self.embed_x: A linear layer to embed the input data x into the hidden space.
+
+        self.cde_func = CDEFunc(input_channels_x, hidden_channels_x) #self.cde_func: An instance of the CDEFunc class, which defines the function f_theta for the CDE
+
+        self.combine_z = torch.nn.Linear(
+            (hidden_channels_x + hidden_channels_x) // 2,
+            hidden_channels_x * hidden_channels_x,
+        ) #self.combine_z: A linear layer that combines the hidden states.
+        self.outcome = torch.nn.Linear(hidden_channels_x, output_channels) #self.outcome: A linear layer that maps the hidden state to the output.
+        self.treatment = torch.nn.Linear(hidden_channels_x, 4) #self.treatment: A linear layer for predicting a treatment.
+        self.softmax = torch.nn.Softmax(dim=4) #self.softmax: Softmax function used on the treatment prediction.
+        self.interpolation = interpolation #self.interpolation: Stores the interpolation method.
+
+        self.dropout_layer = torch.nn.Dropout(0.1) #self.dropout_layer: A dropout layer to prevent overfitting.
+        
+        ############## I think I need to add the below so I can do this treatment strategy counterfactual prediction
+        self.relapse_head = nn.Linear(hidden_channels_x, 1)
+        self.latent_update = nn.Sequential(
+            nn.Linear(hidden_channels_x + 3, hidden_channels_x),
+            nn.ReLU(),
+            nn.Linear(hidden_channels_x, hidden_channels_x)
+            )
+        ################
+
+        logging.info(f"Interpolation type: {self.interpolation}")
+
+    def forward(self, coeffs_x, device, mcd=True):
+        if self.interpolation == "cubic": #Based on the interpolation method, either cubic
+            x = torchcde.NaturalCubicSpline(coeffs_x)
+        elif self.interpolation == "linear": #or linear interpolation is applied to the input data
+            x = torchcde.LinearInterpolation(coeffs_x)
+        else:
+            raise ValueError(
+                "Only 'linear' and 'cubic' interpolation methods are implemented.",
+            )
+
+        ######################
+        # Easy to forget gotcha: Initial hidden state should be a function of the first observation.
+        ######################
+        z_x = torch.tensor(
+            self.embed_x(x.evaluate(x.interval[0])),
+            dtype=torch.float,
+            device=device,
+        ) #initial hidden state z_x is set to the result of applying self.embed_x to the evaluated input data at the starting time x.interval[0]. This is stored as a tensor on the correct device.
+
+        ######################
+        # Solve the CDE.
+        ######################
+        # t =x.interval adds the time tracking component to the CDE
+        #print(f"x.interval: {x.interval}")
+        #print(f"x.gridpoints: {x.grid_points}")
+        z_hat = torch.tensor(
+            torchcde.cdeint(
+                X=x,
+                z0=z_x,#z0=z_x specifies the initial condition
+                func=self.cde_func,#func=self.cde_func provides the function f_theta
+                t=x.interval,
+                backend="torchdiffeq", #torchdiffeq backend with the dopri5 method is used to solve the differential equation
+                method="dopri5",
+                options=dict(jump_t=x.grid_points),
+            ),
+            dtype=torch.float,
+            device=device,
+        )#This line performs the actual integration of the CDE over the time interval x.interval using the torchcde.cdeint function.
+
+        ######################
+        # Both the initial value and the terminal value are returned from cdeint; extract just the terminal value,
+        # and then apply a linear map.
+        ######################
+
+        z_hat = z_hat[:, 1]#After solving the CDE, we extract just the terminal value (the value at the end of the time interval).
+
+        if mcd == True:
+            z_hat = self.dropout_layer(z_hat)#If mcd is True, a dropout layer is applied to z_hat to help prevent overfitting.
+        
+        pred_y = self.outcome(z_hat) #The output prediction pred_y is computed by applying self.outcome to z_hat.
+        #* 1150 - removed that mulitplication for the timebeing
+
+        pred_a = self.treatment(z_hat) #The treatment prediction pred_a is computed by applying self.treatment to z_hat.
+
+        pred_a_softmax = F.log_softmax(pred_a, dim=1) #The treatment prediction is then passed through log_softmax, which normalizes it and applies the logarithm.
+
+        return pred_y, pred_a_softmax, pred_a, z_hat #Finally, the method returns the predicted output (pred_y), the softmaxed treatment (pred_a_softmax), the raw treatment (pred_a), and the final hidden state (z_hat).
+    
+   ####################
+   #I think I need this step_foward in order to do this treatment strategy counterfactual prediction
+   ###################
+   
+    def step_forward(self, z, treatment):
+    
+    #Predict next outcome and update latent state based on current treatment and latent state.
+    #treatment: [batch] of ints (1, 2, 3)
+    
+        # Convert treatment to one-hot (assuming 3 treatments)
+        treatment_onehot = F.one_hot(treatment - 1, num_classes=3).float()
+        
+        # Concatenate with latent state
+        input_step = torch.cat([z, treatment_onehot], dim=-1)
+
+        # Transition model: predict relapse + next state
+        relapse_pred = self.relapse_head(input_step)  # shape: [batch, 1]
+        z_next = self.latent_update(input_step)       # shape: [batch, latent_dim]
+
+        return relapse_pred, z_next
