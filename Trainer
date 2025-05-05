@@ -1,0 +1,859 @@
+#TE-CDE trainer
+import argparse
+import logging
+import os
+import pickle
+from copy import deepcopy
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torchcde
+import torchmetrics
+import wandb
+from torch.nn import functional as F
+from tqdm import tqdm
+
+from src.models.CDE_model import NeuralCDE
+from src.utils.data_utils import (
+    data_to_torch_tensor,
+    data_to_torch_tensor_multistep,
+    process_counterfactual_seq_test_data,
+    process_seq_data,
+    read_from_file,
+    write_to_file,
+)
+from src.utils.losses import compute_norm_mse_loss
+from src.utils.training_tools import EarlyStopping, enable_dropout
+
+
+class trainer: #Defines a class named trainer. This is typically used to encapsulate all functionality for training a model, including storing configurations, initializing the model, and training/predicting logic.
+    def __init__( #This is the constructor method. It gets called when you create a new instance of trainer class. The parameters allow customization of the trainer 
+        self,
+        run, #allows you to track the experiment (usually in WandB or similar)
+        hidden_channels_x, #hidden_channels_x: Number of hidden units for the X (features) part of the model.
+        hidden_channels_a, #hidden_channels_a: Number of hidden units for the A (possibly adjacency or auxiliary input (I think treatment here)).
+        output_channels, #output_channels: Number of output units (e.g., for classification or regression). Here I think refers to num timepoints 
+        sample_proportion=1, #Fraction of data to sample for training (defaults to 1 = all data).
+        use_time=True, # A flag to indicate if temporal information should be included.
+        lambda_val=None, # A regularization parameter to control model complexity (like in ridge regression or custom loss penalties).
+    ):
+
+        self.run = run #Stores the run object in the instance for later use (e.g., logging, tracking experiments).
+        self.model = None #Initializes placeholders for models. model is likely for single-step prediction; 
+        self.multistep_model = None #multistep_model for predicting multiple future steps.
+
+        self.device = None #Placeholder for the computation device (e.g., 'cpu' or 'cuda'). Likely to be set later, depending on availability of GPU.
+
+        self.use_time = use_time #Stores the configuration values for use in building the model later.
+        self.hidden_channels_x = hidden_channels_x #^
+        self.hidden_channels_a = hidden_channels_a #^
+        self.output_channels = output_channels #^
+
+        self.sample_proportion = sample_proportion #Also stores sample_proportion and lambda_val in the instance. These may be used during training, loss computation, etc.
+        self.lambda_val = lambda_val #higher regularization rate reduced the chance of overfitting
+#If lambda has small value, the hypothesis function would be more complicated and would have more polynomial terms, so the train error would be low. As lambda increases, the hypothesis function would be more simplified and the train error would increase.
+#But if lambda value is small, it means there's more oppurtunity to overfit, which would lead to out of sample error.
+        if self.use_time == False: #If the use_time flag is False, it sets self.time_concat to 0, implying no temporal features will be concatenated to the input data.
+            self.time_concat = 0
+
+    def _train(self, train_dataloader, model, optimizer, lambda_val): #This is where the actual model training happens for one epoch over the training data.
+        model = model.train() #Sets the model in training mode (activates dropout, batchnorm, etc.).
+
+        treatment_loss = nn.CrossEntropyLoss()  # nn.NLLLoss()#Defines a standard classification loss function for treatment prediction.
+#cross entropy loss also known as log loss, good for classification to measure difference between predicted probability and actual outcome, to minimise the difference during training 
+        train_losses_total = [] #Initializes lists to track total loss, outcome prediction loss (Y), and treatment prediction loss (A).
+        train_losses_y = []
+        train_losses_a = []
+
+        for (batch_coeffs_x, batch_y, batch_treat,) in train_dataloader: #Iterates over the training data loader.
+
+            batch_coeffs_x = torch.tensor(
+                batch_coeffs_x,
+                dtype=torch.float,
+                device=self.device,
+            ) #Converts the input paths to tensors on the correct device.
+
+            outcomes = torch.tensor(
+                batch_y[:, :, 0],
+                dtype=torch.float,
+                device=self.device,
+            )
+            active_entries = torch.tensor(
+                batch_y[:, :, 1],
+                dtype=torch.float,
+                device=self.device,
+            )
+            current_treatment = torch.tensor(
+                batch_treat[:, -1, :],
+                dtype=torch.float,
+                device=self.device,
+            )
+            #Separates out the actual target values, valid/missing indicators, and the last treatment assignment for each sample.
+            
+            # TODO ADD BACK .squeeze(-1)
+            pred_y, pred_a_soft, pred_a, _ = model(batch_coeffs_x, self.device)
+            
+            #Feeds the input into the model and gets predicted outputs:
+                #pred_y: predicted outcomes
+                #pred_a_soft: softmax treatment predictions
+                #pred_a: possibly hard/argmax predictions
+            
+            # compute norm mse loss - outcomes loss
+            loss_y = compute_norm_mse_loss(outcomes, pred_y, active_entries) #Computes MSE loss between prediction and ground truth only for valid entries (respects missingness).
+
+            # compute interventions/actions loss
+            # loss_a = treatment_loss(pred_a_soft, torch.max(current_treatment, 1)[1])
+            loss_a = treatment_loss(pred_a, torch.argmax(current_treatment, dim=1))#Computes classification loss for treatment prediction by comparing to ground truth labels.
+
+            # total_loss
+            total_loss = loss_y + lambda_val * loss_a #Combines outcome and treatment losses, scaled by a regularization factor (lambda_val).
+            #You weight these two objectives using lambda_val to balance outcome vs. treatment learning.
+                #AKA adversarial training 
+
+
+            total_loss.backward()#Standard PyTorch training steps: backpropagation, gradient update, and gradient reset.
+            optimizer.step()#Standard PyTorch training steps: backpropagation, gradient update, and gradient reset.
+            optimizer.zero_grad()#Standard PyTorch training steps: backpropagation, gradient update, and gradient reset.
+
+            train_losses_total.append(total_loss.item()) #Tracks the loss values for later use (e.g., logging or plotting).
+            train_losses_y.append(loss_y.item())
+            train_losses_a.append(loss_a.item())
+
+        return model, train_losses_total, train_losses_y, train_losses_a #Returns the updated model and loss metrics.
+
+    def _test(self, test_dataloader, model, lambda_val):
+        # eval mode
+        model = model.eval()
+
+        treatment_loss = nn.CrossEntropyLoss()  # nn.NLLLoss()
+
+        test_losses_total = []
+        test_losses_y = []
+        test_losses_a = []
+
+        with torch.no_grad():
+            for (
+                batch_coeffs_x_val,
+                batch_y_val,
+                batch_val_treat,
+            ) in test_dataloader:
+
+                batch_coeffs_x_val = torch.tensor(
+                    batch_coeffs_x_val,
+                    dtype=torch.float,
+                    device=self.device,
+                )
+
+                outcomes_val = torch.tensor(
+                    batch_y_val[:, :, 0],
+                    dtype=torch.float,
+                    device=self.device,
+                )
+                active_entries_val = torch.tensor(
+                    batch_y_val[:, :, 1],
+                    dtype=torch.float,
+                    device=self.device,
+                )
+                current_treatment_val = torch.tensor(
+                    batch_val_treat[:, -1, :],
+                    dtype=torch.float,
+                    device=self.device,
+                )
+
+                # TODO ADD BACK .squeeze(-1)
+                pred_y_val, pred_a_val, pred_a, _ = model(
+                    batch_coeffs_x_val,
+                    self.device,
+                )
+
+                # compute norm mse loss - outcomes loss
+                loss_y_val = compute_norm_mse_loss(
+                    outcomes_val,
+                    pred_y_val,
+                    active_entries_val,
+                )
+
+                # compute interventions/actions loss
+
+                loss_a_val = treatment_loss(
+                    pred_a,
+                    torch.argmax(current_treatment_val, dim=1),
+                )
+
+                # total_loss
+                total_loss_val = loss_y_val + lambda_val * loss_a_val
+
+                test_losses_total.append(total_loss_val.item())
+                test_losses_y.append(loss_y_val.item())
+                test_losses_a.append(loss_a_val.item())
+
+        return model, test_losses_total, test_losses_y, test_losses_a
+
+    def prepare_dataloader(self, data, batch_size):
+        data_X, data_A, data_Time, data_y, data_tr, _, _ = data_to_torch_tensor(
+            data,
+            sample_prop=self.sample_proportion,
+        )
+
+        data_concat = torch.cat((data_X, data_A), 2) #Concatenates X (covariates) and A (treatment) features along the feature axis — forming the full model input.
+
+        data_shape = list(data_concat.shape)
+
+        # to make it continuous we interpolate (linear - keep causal interpretation)
+        coeffs = torchcde.linear_interpolation_coeffs(data_concat) #Creates CDE-compatible interpolation coefficients, allowing the model to treat the data as a continuous time path.
+
+        # create train data_loader
+        dataset = torch.utils.data.TensorDataset(coeffs, data_y, data_tr) #Packages the data into a format that can be iterated in batches.
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=512) #Packages the data into a format that can be iterated in batches.
+
+        return dataloader, data_shape
+
+    def prepare_dataloader_multistep(self, data, batch_size, max_horizon):
+        data_X, data_A, data_Time, data_y, data_tr, _, _ = data_to_torch_tensor(
+            data,
+            sample_prop=self.sample_proportion,
+        )
+
+        if torch.cuda.is_available():#Checks if a GPU is available. If so, use it; otherwise, use the CPU.
+            device_type = "cuda"
+        else:
+            device_type = "cpu"
+
+        device = torch.device(device_type)
+
+        encode_concat = torch.cat((data_X, data_A), 2)#Concatenates data_X and data_A along the feature dimension (dim=2).This combines all inputs needed to feed the CDE model.
+
+        # to make it continuous we interpolate (linear - keep causal interpretation)
+        encode_coeffs = torchcde.linear_interpolation_coeffs(encode_concat)#Converts the discrete time series encode_concat into interpolation coefficients for torchcde. Linear interpolation is used to maintain a causal interpretation.
+        encode_coeffs = torch.tensor(encode_coeffs, dtype=torch.float, device=device)#The result is moved to the proper computation device.
+
+        pred_y_test_sample, pred_a_test_sample, pred_a_test, z_hat_sample = self.model(
+            encode_coeffs,
+            device,
+        )#Pass interpolated inputs through the model:
+                #pred_y_test_sample: predicted outcomes.
+                #pred_a_test_sample: predicted treatment probs (softmaxed).
+                #pred_a_test: raw treatment logits.
+                #z_hat_sample: final hidden state from the CDE, which represents the learned state of the system.
+
+        processed_data_multi = process_seq_data(
+            data_map=data,
+            states=z_hat_sample.cpu().detach().numpy(),
+            projection_horizon=20,
+        )#process_seq_data() takes sequential patient data and learned latent states (z_hat_sample) from the Neural CDE encoder, 
+         #and then creates a sliding window dataset for multi-step sequence-to-sequence training.
+         #It turns each patient's single sequence into many training examples, each starting at a different time point 
+         #and aiming to predict the next projection_horizon steps — teaching the model how to predict not just one step ahead, but many.
+
+        data_X, data_A, data_Time, data_y, data_tr = data_to_torch_tensor_multistep(
+            processed_data_multi,
+            sample_prop=self.sample_proportion,
+            max_horizon=max_horizon,
+        )#takes the projected data and converts it into a tensor again, but now ready for mulitstep forecasting
+
+        data_concat = torch.cat((data_X, data_A), 2)
+        data_shape = list(data_concat.shape)
+
+        # to make it continuous we interpolate (linear - keep causal interpretation)
+        coeffs = torchcde.linear_interpolation_coeffs(data_concat)#interpolate this new projected data
+
+        # create train data_loader
+        dataset = torch.utils.data.TensorDataset(coeffs, data_y, data_tr)#creating a pytorch dataset
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=512)#A DataLoader wraps this dataset for batching and iteration.
+        return dataloader, data_shape #Finally, returns both the dataloader and the data shape.
+
+    def fit(self, train_data, validation_data, epochs, patience, batch_size):
+        logging.info("Getting training data")
+
+        if torch.cuda.is_available():
+            device_type = "cuda"
+        else:
+            device_type = "cpu"
+
+        device = torch.device(device_type)
+
+        self.device = device
+
+        logging.info(f"Predicting using device: {device_type}")
+        early_stopping = EarlyStopping(patience=patience, delta=0.0001)
+
+        # create dataloaders
+        train_dataloader, data_shape = self.prepare_dataloader(
+            data=train_data,
+            batch_size=int(batch_size),
+        )
+        val_dataloader, _ = self.prepare_dataloader(
+            data=validation_data,
+            batch_size=int(batch_size),
+        )
+
+        ######################
+        logging.info("Instantiating Neural CDE")
+
+        model = NeuralCDE(
+            input_channels_x=data_shape[2],
+            hidden_channels_x=self.hidden_channels_x,
+            output_channels=20,
+        )
+
+        model = model.to(self.device)
+
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.0001, momentum=0.9)
+
+        self.run.watch(model, log="all")
+
+        logging.info("Training CDE")
+        epochs = 100
+
+        # allows lambda to vary across training
+        lambda_vals = np.linspace(0.0, 1.0, num=epochs)
+
+        for epoch in tqdm(range(epochs)):
+
+            lambda_val = lambda_vals[epoch]
+            logging.info(f"Training epoch: {epoch} & lambda: {lambda_val}")
+            # put into train mode
+            model, train_losses_total, train_losses_y, train_losses_a = self._train(
+                train_dataloader=train_dataloader,
+                model=model,
+                optimizer=optimizer,
+                lambda_val=lambda_val,
+            )
+
+            # zero grad check out + early stopping
+            logging.info(f"Validation epoch: {epoch}")
+            model, val_losses_total, val_losses_y, val_losses_a = self._test(
+                test_dataloader=val_dataloader,
+                model=model,
+                lambda_val=lambda_val,
+            )
+
+            tqdm.write(
+                f"Epoch: {epoch}   Training loss: {np.average(train_losses_total)} ; Train Treatment loss: {np.average(train_losses_a)} ; Train Outcome loss: {np.average(train_losses_y)}, Val loss: {np.average(val_losses_total)} ;Val Treatment loss: {np.average(val_losses_a)} ; Val Outcome loss: {np.average(val_losses_y)}",
+            )
+
+            if int(np.average(train_losses_y)) > 100000 or np.average(
+                train_losses_y,
+            ) == float("nan"):
+                import sys
+
+                raise ValueError("Exiting run...")
+
+            self.run.log(
+                {
+                    "Epoch": epoch,
+                    "Training loss": np.average(train_losses_total),
+                    "Train Treatment loss": np.average(train_losses_a),
+                    "Train Outcome loss": np.average(train_losses_y),
+                    "Val loss": np.average(val_losses_total),
+                    "Val Treatment loss": np.average(val_losses_a),
+                    "Val Outcome loss": np.average(val_losses_y),
+                },
+            )
+            
+            print(f"Training Loss: {np.average(train_losses_total)}")
+
+            # Log model checkpoint to wandb
+            torch.save(model.state_dict(), f"./tmp_models/model_epoch_{epoch}.h5")
+            #self.run.save(f"./tmp_models/model_epoch_{epoch}.h5")
+
+            # early_stopping needs the validation loss to check if it has decresed,
+            # and if it has, it will make a checkpoint of the current model
+            early_stopping(np.average(val_losses_y), model)
+
+            if early_stopping.early_stop:
+                print("Early stopping phase initiated...")
+                break
+
+        # load best model
+        model.load_state_dict(torch.load("checkpoint.pt"))
+
+        # Log model checkpoint to wandb
+        torch.save(model.state_dict(), "./tmp_models/model_final.h5")
+        #self.run.save("./tmp_models/model_final.h5")
+
+        self.model = model
+
+    def predict(self, test_data):
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        logging.info(f"Predicting with: {device}")
+
+        treatment_loss = nn.CrossEntropyLoss()  # nn.NLLLoss()
+
+        # training_processed
+        (
+            test_X,
+            test_A,
+            test_Time,
+            test_y,
+            test_treat,
+            treated_indices,
+            untreated_indices,
+        ) = data_to_torch_tensor(
+            test_data,
+            sample_prop=self.sample_proportion,
+        )
+
+        test_concat = torch.cat((test_X, test_A), 2)
+
+        # to make it continuous we interpolate (linear - keep causal interpretation)
+        test_coeffs = torchcde.linear_interpolation_coeffs(test_concat)
+
+        test_coeffs = torch.tensor(test_coeffs, dtype=torch.float, device=device)
+
+        outcomes_test = torch.tensor(test_y[:, :, 0], dtype=torch.float, device=device)
+        active_entries_test = torch.tensor(
+            test_y[:, :, 1],
+            dtype=torch.float,
+            device=device,
+        )
+        current_treatment_test = torch.tensor(
+            test_treat[:, -1, :],
+            dtype=torch.float,
+            device=device,
+        )
+
+        mcd = True
+        if mcd:
+            #print("MODEL BEFORE ENABLING DROPOUT:", self.model)
+            self.model = enable_dropout(self.model)
+
+            pred_y_test_list = []
+            pred_a_test_list = []
+            z_hat_test_list = []
+            pred_a_list = []
+
+            for i in range(2):
+                (
+                    pred_y_test_sample,
+                    pred_a_test_sample,
+                    pred_a,
+                    z_hat_sample,
+                ) = self.model(test_coeffs, device)
+                pred_y_test_list.append(pred_y_test_sample)
+                pred_a_test_list.append(pred_a_test_sample)
+                pred_a_list.append(pred_a)
+                z_hat_test_list.append(z_hat_sample)
+
+            write_to_file(pred_y_test_list, "test_y_preds.p")
+            write_to_file(pred_a_test_list, "test_a_preds.p")
+            write_to_file(z_hat_test_list, "latent.p")
+
+            pred_y_test = torch.mean(torch.stack(pred_y_test_list), dim=0)
+            pred_a_test = torch.mean(torch.stack(pred_a_test_list), dim=0)
+            pred_a_out = torch.mean(torch.stack(pred_a_list), dim=0)
+
+        else:
+            pred_y_test, pred_a_test = self.model(test_coeffs, device)
+
+        # compute norm mse loss - outcomes loss
+        loss_y_test = compute_norm_mse_loss(
+            outcomes_test,
+            pred_y_test,
+            active_entries_test,
+        )
+
+        loss_y_treated = compute_norm_mse_loss(
+            outcomes_test[treated_indices],
+            pred_y_test[treated_indices],
+            active_entries_test[treated_indices],
+        )
+
+        loss_y_untreated = compute_norm_mse_loss(
+            outcomes_test[untreated_indices],
+            pred_y_test[untreated_indices],
+            active_entries_test[untreated_indices],
+        )
+
+        # compute interventions/actions loss
+        loss_a_test = treatment_loss(
+            pred_a_test,
+            torch.max(current_treatment_test, 1)[1],
+        )
+
+        acc = torchmetrics.functional.accuracy(
+            F.softmax(pred_a_test, dim=1),
+            torch.argmax(current_treatment_test, dim=1),
+        )
+
+        write_to_file(outcomes_test, "test_y.p")
+        write_to_file(active_entries_test, "active.p")
+        write_to_file(current_treatment_test, "test_a.p")
+
+        self.run.log(
+            {
+                "Test Treatment loss": loss_a_test.item(),
+                "RMSE Test Outcome loss": np.sqrt(loss_y_test.item()),
+                "RMSE Test TREATED loss": np.sqrt(loss_y_treated.item()),
+                "RMSE Test UNTREATED loss": np.sqrt(loss_y_untreated.item()),
+                "Test ACC": acc.item(),
+            },
+        )
+
+    def fit_multistep( #A training loop (fit_multistep) that uses this NeuralCDE model
+        self,
+        train_data,
+        validation_data,
+        epochs,
+        patience,
+        batch_size,
+        max_horizon,
+    ):
+        logging.info("Getting training data for multistep")
+
+        if torch.cuda.is_available():
+            device_type = "cuda"
+        else:
+            device_type = "cpu"
+
+        device = torch.device(device_type)
+
+        self.device = device
+
+        logging.info(f"Predicting using device: {device_type}")
+        early_stopping = EarlyStopping(patience=patience, delta=0.0001)#Initializes early stopping with the patience value (i.e., how many epochs to wait for improvement).
+        #check at this point what my model is
+        #self.model = model
+        print("Model:", self.model)
+        
+        # create dataloaders
+        train_dataloader, data_shape = self.prepare_dataloader_multistep(
+            data=train_data,
+            batch_size=int(batch_size),
+            max_horizon=max_horizon,
+        )#Converts train_data into a DataLoader using the sliding-window method in process_seq_data
+        val_dataloader, _ = self.prepare_dataloader_multistep(
+            data=validation_data,
+            batch_size=int(batch_size),
+            max_horizon=max_horizon,
+        )#Does the same for validation data.
+
+        ######################
+        logging.info("Instantiating Neural CDE multistep")
+
+        model_multistep = NeuralCDE(
+            input_channels_x=data_shape[2],
+            hidden_channels_x=self.hidden_channels_x,
+            output_channels=20,
+        )#creates a fresh neural CDE model 
+        #input is the concatenated features (covariates + treatment)
+        #Output: 20-dimensional predictions (matches your output horizon × dim (1)).
+
+        model_multistep = model_multistep.to(self.device) #Moves model to GPU/CPU.
+
+        #using stochastic gradient descent 
+        #Stochastic Gradient Descent (SGD) is a machine learning optimization algorithm that updates model parameters using gradients calculated from a randomly selected subset (or a single data point) of the training dataset, making it efficient for large datasets and online learning. 
+        optimizer_multistep = torch.optim.SGD(
+            model_multistep.parameters(),
+            lr=0.0001,
+            momentum=0.9,
+        ) #setting up the optimiser, using sotachastic gradient descent witha small learning rate and good momentum to smooth updates 
+        #Learning rate, or step size, is represented by the Greek letter η, and determines the size of the changes the model is permitted to make. 
+        #Learning rate helps ensure that a model learns enough from training to make meaningful adjustments to its parameters while also not overcorrecting. Imagine descending a hill. To reach the bottom safely, one must travel fast enough to make meaningful progress, but not too fast that one loses control and stumbles. 
+        
+        
+        # optimizer =  = torch.optim.Adam(model.parameters())  # , lr=0.01
+        # optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)  # , lr=0.01
+
+        self.run.watch(model_multistep, log="all") #Hooks the model into wandb for full logging/monitoring of gradients, weights, etc.
+
+        logging.info("Training CDE")
+
+        epochs = 10
+        lambda_vals = np.linspace(0.0, 1.0, num=epochs) #lambda_vals: used to gradually increase the weight of a certain loss component (likely treatment vs. outcome loss — see below).
+
+        for epoch in tqdm(range(epochs)):
+
+            lambda_val = lambda_vals[epoch] #Progressively scales lambda_val from 0 to 1.
+            logging.info(f"Training epoch: {epoch} & lambda: {lambda_val}")
+            # put into train mode
+
+            (
+                model_multistep,
+                train_losses_total,
+                train_losses_y,
+                train_losses_a,
+            ) = self._train(
+                train_dataloader=train_dataloader,
+                model=model_multistep,
+                optimizer=optimizer_multistep,
+                lambda_val=lambda_val,
+            ) #Runs a training epoch, returning:
+                    #train_losses_total: overall loss
+                    #train_losses_y: loss on predicted outcomes
+                    #train_losses_a: loss on predicted treatments (if applicable)
+
+            # zero grad check out + early stopping
+            logging.info(f"Validation epoch: {epoch}")
+            
+            model_multistep, val_losses_total, val_losses_y, val_losses_a = self._test(
+                test_dataloader=val_dataloader,
+                model=model_multistep,
+                lambda_val=lambda_val,
+            ) #Runs a validation pass.
+
+            tqdm.write(
+                f"Epoch: {epoch}   Training loss: {np.average(train_losses_total)} ; Train Treatment loss: {np.average(train_losses_a)} ; Train Outcome loss: {np.average(train_losses_y)}, Val loss: {np.average(val_losses_total)} ;Val Treatment loss: {np.average(val_losses_a)} ; Val Outcome loss: {np.average(val_losses_y)}",
+            )#Nicely formatted epoch summary printed to console/log.
+
+            #Sanity Check + Logging - Fails fast if loss explodes or becomes NaN.
+            if int(np.average(train_losses_y)) > 100000 or np.average(
+                train_losses_y,
+            ) == float("nan"):
+                import sys
+
+                raise ValueError("Exiting multistep run...")
+                
+            #Logs epoch stats to Weights & Biases (wandb).
+            self.run.log(
+                {
+                    "Epoch": epoch,
+                    "Training loss": np.average(train_losses_total),
+                    "Train Treatment loss": np.average(train_losses_a),
+                    "Train Outcome loss": np.average(train_losses_y),
+                    "Val loss": np.average(val_losses_total),
+                    "Val Treatment loss": np.average(val_losses_a),
+                    "Val Outcome loss": np.average(val_losses_y),
+                },
+            )
+
+            # Log model checkpoint to wandb
+            torch.save(
+                model_multistep.state_dict(),
+                f"./tmp_models/model_multi_epoch_{epoch}.h5",
+            )
+            self.run.save(f"./tmp_models/model_multi_epoch_{epoch}.h5")
+
+            # early_stopping needs the validation loss to check if it has decresed,
+            # and if it has, it will make a checkpoint of the current model
+            early_stopping(np.average(val_losses_y), model_multistep)
+
+            if early_stopping.early_stop:
+                print("Early stopping phase initiated...")
+                break
+
+        # load best model
+        model_multistep.load_state_dict(torch.load("checkpoint.pt")) #saving the best model
+
+        # Log model checkpoint to wandb
+        torch.save(model_multistep.state_dict(), "./tmp_models/model_multi_final.h5")
+        self.run.save("./tmp_models/model_multi_final.h5")
+
+        self.multistep_model = model_multistep #store the trainer model for later use (with counterfactual testing)
+
+    def multistep_predict(self, test_data, max_horizon): #A prediction function (multistep_predict) to forecast outcomes and treatment effects
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu") #Set device (GPU if available).
+
+        logging.info(f"Predicting with: {device}") #log it 
+
+        treatment_loss = nn.CrossEntropyLoss()  # Define cross-entropy loss for evaluating treatment prediction.
+
+        #redundant because done above
+        if torch.cuda.is_available():
+            device_type = "cuda"
+        else:
+            device_type = "cpu"
+
+        device = torch.device(device_type)
+        #########################
+        #Convert raw test data to tensors:
+        test_X, test_A, test_Time, test_y, test_treat, _, _ = data_to_torch_tensor(
+            test_data,
+            sample_prop=self.sample_proportion,
+        )
+        
+        #Combine features and treatments for the encoder input (Neural CDE expects all features together).
+        encode_concat = torch.cat((test_X, test_A), 2) # 
+
+        # to make it continuous we interpolate (linear - keep causal interpretation)
+        encode_coeffs = torchcde.linear_interpolation_coeffs(encode_concat)
+        encode_coeffs = torch.tensor(encode_coeffs, dtype=torch.float, device=device)
+
+        pred_y_test_sample, pred_a_test_sample, pred_a_test, z_hat_sample = self.model(
+            encode_coeffs,
+            device,
+        )#initial prediction - encoding the latent states
+        #foward pass of the model 
+        #z_hat_sample: latent states after initial encoding.
+
+        logging.info("Processing counterfactual data...")
+        
+        #Generate Counterfactual Sequences
+        processed_data_multi = process_counterfactual_seq_test_data(
+            data_map=test_data,
+            states=z_hat_sample.cpu().detach().numpy(),#this is where the model is predicting states
+            projection_horizon=max_horizon,
+        )#Uses model-inferred states (z_hat_sample) to generate counterfactual futures for a given projection horizon.
+
+        test_X, test_A, test_Time, test_y, test_treat = data_to_torch_tensor_multistep(
+            processed_data_multi,
+            sample_prop=self.sample_proportion,
+            max_horizon=max_horizon,
+        )#Converts the counterfactual sequences into tensors
+
+        data_concat = torch.cat((test_X, test_A), 2)#Combines features and treatments again.
+        data_shape = list(data_concat.shape)
+
+        # to make it continuous we interpolate (linear - keep causal interpretation)-Interpolates the counterfactual input for CDE prediction.
+        test_coeffs = torchcde.linear_interpolation_coeffs(data_concat)
+        test_coeffs = torch.tensor(test_coeffs, dtype=torch.float, device=device)
+
+        #Set up labels for evaluation
+        outcomes_test = torch.tensor(test_y[:, :, 0], dtype=torch.float, device=device)#outcomes_test: the true future outcomes
+        active_entries_test = torch.tensor(test_y[:, :, 1], dtype=torch.float, device=device,)#active_entries_test: missingness mask
+        current_treatment_test = torch.tensor(test_treat[:, -1, :], dtype=torch.float, device=device,)#current_treatment_test: the most recent treatment given
+
+        #Uses an autoregressive loop to forecast max_horizon steps.
+        pred_y_test, pred_a_test, pred_a = self.pred_auto(
+            test_coeffs,
+            device=device,
+            max_horizon=max_horizon,
+        )#Each call to self.multistep_model(...) predicts one step forward.(?)
+
+        #Computes normalized MSE for the final step of horizon.
+        loss_y_test = compute_norm_mse_loss(
+            outcomes_test[:, max_horizon - 1],
+            pred_y_test[:, max_horizon - 1],
+            active_entries_test[:, max_horizon - 1],
+        )#This is the main loss used to measure outcome forecasting accuracy.
+
+        #RMSEs for All Horizon Steps
+        rmses = []
+
+        rmses.append(
+            torch.sqrt(
+                compute_norm_mse_loss(outcomes_test, pred_y_test, active_entries_test),
+            ).item(),
+        )
+        
+        #Stepwise RMSEs (1-step ahead, 2-step ahead, etc.)
+        for i in range(max_horizon):
+            rmses.append(
+                torch.sqrt(
+                    compute_norm_mse_loss(
+                        outcomes_test[:, i],
+                        pred_y_test[:, i],
+                        active_entries_test[:, i],
+                    ),
+                ).item(),
+            )
+
+        #Treatment Accuracy
+        acc_scores = []
+        for i in range(max_horizon):
+            true = torch.tensor(
+                processed_data_multi["current_treatments"][:, i, :],
+                dtype=torch.float,
+                device=device,
+            )
+            acc_scores.append(
+                torchmetrics.functional.accuracy(
+                    F.softmax(pred_a[i], dim=1),
+                    torch.argmax(true, dim=1),
+                ),
+            )
+
+        #Log to wandb
+        self.run.log(
+            {
+                "RMSE MULTISTEP Test Outcome loss": np.sqrt(loss_y_test.item()),
+            },
+        )
+
+        # RMSEs at other interval
+        for i in range(len(rmses) - 1):
+            self.run.log({f"RMSE @ {i+1} ": rmses[::-1][i]})
+
+        for idx, acc in enumerate(acc_scores):
+            self.run.log(
+                {
+                    f"MULTISTEP ACC @ {idx+1}": acc.item(),
+                },
+            )
+
+    #Autoregressive Multistep Prediction
+    '''
+    #This helper function is a time loop for autoregressive prediction:
+    def pred_auto(self, test_coeffs, device, max_horizon):
+        projection_horizon = max_horizon
+        preds = []
+        pred_a = []
+        for t in range(0, projection_horizon):
+            predictions, pred_a_sample_test, pred_a_sample, _ = self.multistep_model(
+                test_coeffs,
+                device,
+            )
+            preds.append(predictions)
+            pred_a.append(pred_a_sample)
+            #Each step:
+                #Feeds the latent state into the model again
+                #Appends predictions and treatment estimates 
+            
+        return predictions, pred_a_sample_test, pred_a #Returns the last prediction (predictions), the final treatment estimate (pred_a_sample_test), and all per-step predictions (pred_a).
+
+    '''
+    def pred_auto(self, test_coeffs, device, strategy, threshold=0.5):
+    
+    #Autoregressive rollout for counterfactual simulation.
+    
+        projection_horizon = 20
+        preds = []
+        treatments = []
+
+    # Step 1: Encode past into latent z using NeuralCDE
+        _, _, _, z = self.multistep_model(test_coeffs, device)  # z is [batch, hidden_dim]
+
+    # Step 2: Initialize treatment based on strategy
+        if strategy == "1→2→3":
+            treatment = torch.ones(z.size(0), dtype=torch.long, device=z.device)
+        elif strategy == "2→3":
+            treatment = torch.full((z.size(0),), 2, dtype=torch.long, device=z.device)
+        elif strategy == "just3":
+            treatment = torch.full((z.size(0),), 3, dtype=torch.long, device=z.device)
+        else:
+            raise ValueError("Invalid strategy")
+
+        for step in range(projection_horizon):
+      # Step 3: Predict relapse (binary classification)
+            pred_relapse, z_next = self.step_forward(z, treatment)
+            relapse_prob = torch.sigmoid(pred_relapse).squeeze()
+
+      # Step 4: Store
+            preds.append(relapse_prob.detach().cpu())
+            treatments.append(treatment.detach().cpu())
+
+      # Step 5: Escalate treatment if relapse
+            if strategy in ["1→2→3", "2→3"]:
+                should_escalate = (relapse_prob >= threshold) & (treatment < 3)
+                treatment = torch.where(should_escalate, treatment + 1, treatment)
+
+    # Step 6: Move latent state forward
+            z = z_next
+
+    # Step 7: Stack across time
+            preds = torch.stack(preds, dim=1)
+            treatments = torch.stack(treatments, dim=1)
+
+        return preds, treatments
+
+#and to help evaluate the model using actual treatments 
+    def predict_given_actual(self, test_coeffs, actual_treatments, device):
+        projection_horizon = actual_treatments.size(1)
+        preds = []
+
+        _, _, _, z = self.multistep_model(test_coeffs, device)
+
+        for t in range(projection_horizon):
+            treatment = actual_treatments[:, t]
+            pred_relapse, z = self.step_forward(z, treatment)
+            relapse_prob = torch.sigmoid(pred_relapse).squeeze()
+            preds.append(relapse_prob.detach().cpu())
+
+        preds = torch.stack(preds, dim=1)
+        return preds
+
+    
