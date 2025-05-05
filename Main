@@ -1,0 +1,209 @@
+import argparse
+import logging
+import os
+import pickle
+import traceback
+from copy import deepcopy
+
+import os
+os.environ["WANDB_DISABLE_SYMLINK"] = "true"
+
+import wandb
+
+import yaml
+
+#from src.utils.cancer_simulation import get_cancer_sim_data
+from src.utils.data_utils import process_data, read_from_file, write_to_file
+#from src.utils.process_irregular_data import *
+from trainer import trainer
+import numpy as np
+
+#os.environ["WANDB_API_KEY"] = "ADD YOUR WANDB API KEY HERE"
+wandb_entity = "ck624-univeristy-of-cambridge"
+
+#TO DO:
+        #fix time_covariates (intensity) within my data structure - DONE
+        #check if correct:
+        #current treatments here goes to end (59)- YES
+        #previous treatments here goes to prediction point (58) - YES
+        #and there is no previous covariates, only current covariates (goes to 59)
+        #and time covariates is really just intensity: the number of cumulative visits a patient had at each time (goes to 59)
+        #in the past one we didn't have future covairates...
+        #potentially need to fix the output channels - currently set to 59...but we only have 40 timepoints and want to predict the last 20?
+        #output channels should equal 20 (num of future timepoints * D (number of features we want to predict))
+        #need to sort out the multistep system
+            #because we want to predict the future timestep, then update the model input, and then predict, then add that prediction to model input etc
+        #need to think about active entries system - what do we want that mask to look like?
+        #have a think about the fact that it can supposedly handle untreated patients...
+        #chec in the def _train that outcomes, active entries, and current treatments are all being sliced from the right place
+        #in dtaa_utils check the way it's handling the multistep data generation
+        #need to check each line in the trainer.py def prepare_dataloader_multistep
+        
+        #STEP 1: Fix active entries in the process_seq_data so we can predict with static treatments (1 the whole time, 2 the whole time, etc)
+        #STEP 2: Add in so it updates the treatment strategy based on the predicted outcome 
+        
+def init_arg():
+    parser = argparse.ArgumentParser()
+    #parser.add_argument("--chemo_coeff", default=2, type=int)
+    #parser.add_argument("--radio_coeff", default=2, type=int)
+    parser.add_argument("--results_dir", default="results")
+    parser.add_argument("--model_name", default="te_cde_trial")
+    parser.add_argument("--load_dataset", default=True)
+    parser.add_argument("--experiment", type=str, default="default")
+    parser.add_argument("--data_path", type=str, default='C:/Users/ck624/my_AI_projects/TE-CDE/pickle_map_ms_TECDE.npy')
+    parser.add_argument("--use_transformed", default=True)
+    parser.add_argument("--multistep", default=True) #[--multistep [boolean whether to run the multistep function]]
+    #multistep is saying you have multiple timpoints in the future you want to predict for
+    parser.add_argument("--kappa", type=int, default=10)
+    parser.add_argument("--lambda_val", type=float, default=1)
+    parser.add_argument("--max_samples", type=int, default=1)
+    parser.add_argument("--max_horizon", type=int, default=20)
+    parser.add_argument("--save_raw_datapath", type=str, default=None)
+    parser.add_argument("--save_transformed_datapath", type=str, default=None)
+    return parser.parse_args()
+
+args = init_arg()     #setting arguments
+
+if not os.path.exists("./tmp_models/"):
+        os.mkdir("./tmp_models/")
+        
+    #use_transformed = str(args.use_transformed) == "True"
+data_path = "C:/Users/ck624/my_AI_projects/TE-CDE/pickle_map_ms_TECDE.npy"
+multistep =  "True"
+    
+logging.basicConfig(format="%(levelname)s:%(message)s", level=logging.INFO)
+logging.getLogger().setLevel(logging.INFO)
+    
+    #i dont think I need the strategy argument but if I do
+    #STRATGEY WOULD GO HERE
+    
+logging.info("WANDB init...")
+    
+# start a new run
+run = wandb.init(
+    project="te_cde_run_trial_multistep",
+    entity=wandb_entity,
+    config=f"./experiments/default.yaml",
+    #settings=wandb.Settings(disable_symlink=True)
+        #config = f"./TE-CDE/experiments/default.yaml",
+)
+
+config = wandb.config
+    
+#with open("./experiments/default.yaml", "r") as f:
+ #   config = yaml.safe_load(f)
+    
+    #get data
+pickle_map = np.load('pickle_map_ms_TECDE.npy', allow_pickle=True).item()
+    
+kappa = int(args.kappa)
+wandb.log({"kappa": kappa})
+    
+lambda_val = float(args.lambda_val)
+wandb.log({"lambda": lambda_val})
+
+max_samples = int(args.max_samples)
+wandb.log({"max_samples": max_samples})
+
+max_horizon = int(args.max_horizon)
+wandb.log({"max_horizon": max_horizon})
+
+    #process data
+logging.info("Processing dataset")
+training_processed, validation_processed, test_processed, test_data_counterfactuals = process_data(pickle_map)
+
+use_time = config["use_time"]
+
+#chnage so intensity is actually time_covariates
+training_processed['time_covariates'] = training_processed['intensity'][:, : , np.newaxis]
+#change previous treatments
+
+#now chnage in validation
+validation_processed['time_covariates'] = validation_processed['intensity'][:, : , np.newaxis]
+
+#change in test
+test_processed['time_covariates'] = test_processed['intensity'][:, : , np.newaxis]
+
+import logging
+import traceback
+import os
+
+if __name__ == "__main__":
+    done = False
+    tries = 0
+
+    while done == False:
+        if tries > 10:
+            done = True
+            break
+
+        try:
+            logging.info("Training model...")
+            cde_trainer = trainer(
+                run=run,
+                hidden_channels_x=config["hidden_channels_x"],
+                hidden_channels_a=config["hidden_channels_a"],
+                output_channels=config["output_channels"],
+                sample_proportion=config["sample_proportion"],
+                use_time=config["use_time"],
+                lambda_val=lambda_val,  # lambda limits how much complexity the model can have — too much and you overfit
+            )
+
+            wandb.log({"proportion": config["sample_proportion"]})
+
+            cde_trainer.fit(
+                train_data=training_processed,
+                validation_data=validation_processed,
+                epochs=config["epochs"],
+                patience=config["patience"],
+                batch_size=10,
+            )
+
+            # TO DO - issue with the way config is being read in and so the arguments
+            # for hidden channels etc are going as dict, int, which is not what it's expecting.
+            # Need to find another way to read in the YAML file.
+
+            logging.info("Testing model...")
+            cde_trainer.predict(test_data=test_processed)
+            done = True
+
+        except Exception as e:
+            print(e)
+            tries += 1
+
+    if bool(multistep) == True:
+        multidone = False
+        multitries = 0
+
+        while multidone == False:
+            if multitries > 10:
+                multidone = True
+                break
+
+            try:
+                logging.info("Fitting multistep model...")
+                cde_trainer.fit_multistep(
+                    train_data=training_processed,
+                    validation_data=validation_processed,
+                    epochs=config["epochs"],
+                    patience=config["patience"],
+                    batch_size=config["batch_size"],
+                    max_horizon=max_horizon,
+                )
+
+                logging.info("Testing multistep model...")
+                cde_trainer.multistep_predict(
+                    test_data=test_processed,
+                    max_horizon=max_horizon,
+                )
+                multidone = True
+
+            except Exception as e:
+                # To traceback where actual error takes place after multiple tries
+                print(traceback.format_exc())
+                multitries += 1
+
+    run.finish()
+
+    # Remove tmp model from file system
+    os.system("rm -rf ./tmp_models/")
