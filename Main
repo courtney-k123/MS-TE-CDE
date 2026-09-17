@@ -1,209 +1,349 @@
+"""Train and evaluate the MS TE-CDE experiment.
+
+Expected input file
+-------------------
+A pickle containing a dictionary with the nine original DataFrames:
+    age_df
+    cumulative_visits_df
+    disability_df
+    disease_duration_df
+    gender_df
+    relapse_df              # cumulative relapse count
+    t2_mri_lesion_df
+    treatment_df            # integer treatment level 0..4
+    visits_df
+
+Example:
+    python main_ms_te_cde.py --data-path ms_dataframes.pkl
+"""
+
+#it expects
+dataframes = {
+    "age_df": age_df,
+    "cumulative_visits_df": cumulative_visits_df,
+    "disability_df": disability_df,
+    "disease_duration_df": disease_duration_df,
+    "gender_df": gender_df,
+    "relapse_df": relapse_df,
+    "t2_mri_lesion_df": t2_mri_lesion_df,
+    "treatment_df": treatment_df,
+    "visits_df": visits_df,
+}
+
+with open("ms_dataframes.pkl", "wb") as f:
+    pickle.dump(dataframes, f)
+
+#
+import numpy as np
+import scipy
+import torch
+import torchdiffeq
+import torchcde
+
+print("NumPy:", np.__version__)
+print("SciPy:", scipy.__version__)
+print("PyTorch:", torch.__version__)
+print("torchcde:", torchcde.__version__)
+
+print("Imports successful.")
+
+import sys
+import numpy as np
+import scipy
+
+print(sys.executable)
+print(np.__file__)
+print(scipy.__file__)
+
+from __future__ import annotations
+
 import argparse
 import logging
-import os
 import pickle
-import traceback
-from copy import deepcopy
+from pathlib import Path
 
-import os
-os.environ["WANDB_DISABLE_SYMLINK"] = "true"
-
-import wandb
-
-import yaml
-
-#from src.utils.cancer_simulation import get_cancer_sim_data
-from src.utils.data_utils import process_data, read_from_file, write_to_file
-#from src.utils.process_irregular_data import *
-from trainer import trainer
 import numpy as np
 
-#os.environ["WANDB_API_KEY"] = "ADD YOUR WANDB API KEY HERE"
-wandb_entity = "ck624-univeristy-of-cambridge"
+from data_utils_ms import (
+    N_TREATMENTS,
+    build_train_val_test,
+    describe_dataset,
+)
+from trainer_ms import Trainer
 
-#TO DO:
-        #fix time_covariates (intensity) within my data structure - DONE
-        #check if correct:
-        #current treatments here goes to end (59)- YES
-        #previous treatments here goes to prediction point (58) - YES
-        #and there is no previous covariates, only current covariates (goes to 59)
-        #and time covariates is really just intensity: the number of cumulative visits a patient had at each time (goes to 59)
-        #in the past one we didn't have future covairates...
-        #potentially need to fix the output channels - currently set to 59...but we only have 40 timepoints and want to predict the last 20?
-        #output channels should equal 20 (num of future timepoints * D (number of features we want to predict))
-        #need to sort out the multistep system
-            #because we want to predict the future timestep, then update the model input, and then predict, then add that prediction to model input etc
-        #need to think about active entries system - what do we want that mask to look like?
-        #have a think about the fact that it can supposedly handle untreated patients...
-        #chec in the def _train that outcomes, active entries, and current treatments are all being sliced from the right place
-        #in dtaa_utils check the way it's handling the multistep data generation
-        #need to check each line in the trainer.py def prepare_dataloader_multistep
-        
-        #STEP 1: Fix active entries in the process_seq_data so we can predict with static treatments (1 the whole time, 2 the whole time, etc)
-        #STEP 2: Add in so it updates the treatment strategy based on the predicted outcome 
-        
-def init_arg():
+try:
+    import wandb
+except ImportError:  # W&B is optional.
+    wandb = None
+
+FORECAST_LENGTH = 20
+
+def parse_args():
     parser = argparse.ArgumentParser()
-    #parser.add_argument("--chemo_coeff", default=2, type=int)
-    #parser.add_argument("--radio_coeff", default=2, type=int)
-    parser.add_argument("--results_dir", default="results")
-    parser.add_argument("--model_name", default="te_cde_trial")
-    parser.add_argument("--load_dataset", default=True)
-    parser.add_argument("--experiment", type=str, default="default")
-    parser.add_argument("--data_path", type=str, default='C:/Users/ck624/my_AI_projects/TE-CDE/pickle_map_ms_TECDE.npy')
-    parser.add_argument("--use_transformed", default=True)
-    parser.add_argument("--multistep", default=True) #[--multistep [boolean whether to run the multistep function]]
-    #multistep is saying you have multiple timpoints in the future you want to predict for
-    parser.add_argument("--kappa", type=int, default=10)
-    parser.add_argument("--lambda_val", type=float, default=1)
-    parser.add_argument("--max_samples", type=int, default=1)
-    parser.add_argument("--max_horizon", type=int, default=20)
-    parser.add_argument("--save_raw_datapath", type=str, default=None)
-    parser.add_argument("--save_transformed_datapath", type=str, default=None)
+    parser.add_argument("--data-path", type=str, default = "ms_dataframes.pkl")
+    parser.add_argument("--output-dir", type=str, default="results_ms_te_cde")
+    parser.add_argument("--random-state", type=int, default=42)
+
+    parser.add_argument("--hidden-channels", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--interpolation", choices=["linear", "cubic"], default="linear")
+
+    # Start with zero to establish that forecasting works before adding treatment balancing.
+    parser.add_argument("--lambda-treatment", type=float, default=0.0)
+    parser.add_argument("--increment-loss-weight", type=float, default=0.25)
+    parser.add_argument("--mc-samples", type=int, default=0)
+
+    parser.add_argument("--use-wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default="ms-te-cde")
+    parser.add_argument("--wandb-name", type=str, default=None)
     return parser.parse_args()
 
-args = init_arg()     #setting arguments
 
-if not os.path.exists("./tmp_models/"):
-        os.mkdir("./tmp_models/")
+def load_dataframes(path: str):
+    with open(path, "rb") as handle:
+        dataframes = pickle.load(handle)
+    if not isinstance(dataframes, dict):
+        raise TypeError("--data-path must contain a dictionary of pandas DataFrames.")
+    return dataframes
+
+
+def save_results(results, test_patient_ids, output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    np.savez_compressed(
+        output_dir / "test_predictions.npz",
         
-    #use_transformed = str(args.use_transformed) == "True"
-data_path = "C:/Users/ck624/my_AI_projects/TE-CDE/pickle_map_ms_TECDE.npy"
-multistep =  "True"
+        patient_ids=test_patient_ids,
+        
+        predicted_cumulative_relapse=results["predicted_cumulative_relapse"],
+            
+        predicted_relapse_increment=results["predicted_relapse_increment"],
+        
+        true_cumulative_relapse=results["true_cumulative_relapse"],
+            
+        true_relapse_increment=results["true_relapse_increment"],
+            
+        future_active=results["future_active"],
+            
+        rmse_by_horizon=results["rmse_by_horizon"],
+            
+        mae_by_horizon=results["mae_by_horizon"],
+        
+        n_active_by_horizon=results["n_active_by_horizon"])
+
+    metrics = {
+        "overall_rmse": results["overall_rmse"],
+        "overall_mae": results["overall_mae"],
+        "rmse_by_horizon": results["rmse_by_horizon"].tolist(),
+        "mae_by_horizon": results["mae_by_horizon"].tolist(),
+        "n_active_by_horizon": results["n_active_by_horizon"].tolist(),
+        }
+
+    with open(output_dir / "metrics.pkl", "wb") as handle:
+        pickle.dump(metrics, handle)
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logging.info("Loading raw MS DataFrames from %s", args.data_path)
+    dataframes = load_dataframes(args.data_path)
+
+    logging.info("Building Q1-Q20 history / Q21-Q40 forecast datasets")
+    training_data, validation_data, test_data, preprocessing_params = build_train_val_test(
+        dataframes,
+        random_state=args.random_state,
+    )
     
-logging.basicConfig(format="%(levelname)s:%(message)s", level=logging.INFO)
-logging.getLogger().setLevel(logging.INFO)
+    with open(output_dir / "test_data.pkl", "wb") as handle:
+        pickle.dump(test_data, handle)
+
+    describe_dataset("TRAIN", training_data)
+    describe_dataset("VALIDATION", validation_data)
+    describe_dataset("TEST", test_data)
+
+    with open(output_dir / "preprocessing_params.pkl", "wb") as handle:
+        pickle.dump(preprocessing_params, handle)
+
+    run = None
+    if args.use_wandb:
+        if wandb is None:
+            raise ImportError("wandb is not installed. Install it or omit --use-wandb.")
+        run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_name,
+            config=vars(args),
+        )
+
+    trainer = Trainer(
+        run=run,
+        hidden_channels=args.hidden_channels,
+        n_treatments=N_TREATMENTS,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        lambda_treatment=args.lambda_treatment,
+        increment_loss_weight=args.increment_loss_weight,
+        dropout=args.dropout,
+        interpolation=args.interpolation,
+        checkpoint_path=str(output_dir / "best_model.pt"),
+    )
     
-    #i dont think I need the strategy argument but if I do
-    #STRATGEY WOULD GO HERE
+    for name, data in [
+    ("train", training_data),
+    ("validation", validation_data),
+    ("test", test_data),
+    ]:
+        print(f"\n{name}")
+
+    for key, value in data.items():
+        if isinstance(value, np.ndarray) and np.issubdtype(value.dtype, np.number):
+            print(
+                key,
+                "shape =", value.shape,
+                "NaN =", np.isnan(value).sum(),
+                "Inf =", np.isinf(value).sum(),
+            )
+
+    trainer.fit(
+        train_data=training_data,
+        validation_data=validation_data,
+        epochs=args.epochs,
+        patience=args.patience,
+        batch_size=args.batch_size,
+    )
+
+    logging.info("Evaluating Q21-Q40 factual forecasts")
     
-logging.info("WANDB init...")
+    results = trainer.predict(
+        test_data,
+        batch_size=args.batch_size,
+        mc_samples=args.mc_samples,)
+
+    logging.info("Overall RMSE: %.4f", results["overall_rmse"])
+    logging.info("Overall MAE: %.4f", results["overall_mae"])
+
+    for horizon, (rmse, mae) in enumerate(
+        zip(results["rmse_by_horizon"], results["mae_by_horizon"]), start=21
+    ):
+        logging.info("Q%d | RMSE %.4f | MAE %.4f", horizon, rmse, mae)
+        
+    # ============================================================
+    # NAIVE BASELINE
+    # Predict that cumulative relapse stays unchanged after Q20
+    # ============================================================
     
-# start a new run
-run = wandb.init(
-    project="te_cde_run_trial_multistep",
-    entity=wandb_entity,
-    config=f"./experiments/default.yaml",
-    #settings=wandb.Settings(disable_symlink=True)
-        #config = f"./TE-CDE/experiments/default.yaml",
-)
-
-config = wandb.config
+    baseline = test_data["baseline_relapse"][:, None]
     
-#with open("./experiments/default.yaml", "r") as f:
- #   config = yaml.safe_load(f)
+    naive_predictions = np.repeat(
+        baseline,
+        FORECAST_LENGTH,
+        axis=1,
+        )
     
-    #get data
-pickle_map = np.load('pickle_map_ms_TECDE.npy', allow_pickle=True).item()
+    true = test_data["future_cumulative_relapse"]
+    future_active = test_data["future_active"]
     
-kappa = int(args.kappa)
-wandb.log({"kappa": kappa})
+    observed = future_active == 1
     
-lambda_val = float(args.lambda_val)
-wandb.log({"lambda": lambda_val})
+    if not observed.any():
+        raise RuntimeError(
+            "No active future observations available in test set."
+            )
+        
+        errors = naive_predictions - true
+        
+        naive_rmse = np.sqrt(
+            np.mean(
+                errors[observed] ** 2
+                )
+            )
+        
+        naive_mae = np.mean(
+            np.abs(
+                errors[observed]
+                )
+            )
+    
+    logging.info("Naive baseline overall RMSE: %.4f", naive_rmse)
 
-max_samples = int(args.max_samples)
-wandb.log({"max_samples": max_samples})
+    logging.info("Naive baseline overall MAE: %.4f", naive_mae,)
+    
+    # Per-quarter naive performance
 
-max_horizon = int(args.max_horizon)
-wandb.log({"max_horizon": max_horizon})
+    naive_rmse_by_horizon = np.full(
+        FORECAST_LENGTH,
+        np.nan,
+        dtype=np.float32,
+        )
+    
+    naive_mae_by_horizon = np.full(
+        FORECAST_LENGTH,
+        np.nan,
+        dtype=np.float32,
+        )
+    
+    naive_n_active_by_horizon = np.zeros(
+        FORECAST_LENGTH,
+        dtype=np.int64,
+        )
+    
+    for t in range(FORECAST_LENGTH):
+        
+        active_t = future_active[:, t] == 1
+        
+        naive_n_active_by_horizon[t] = int(
+            active_t.sum()
+            )
+        
+        if not active_t.any():
+            continue
+        
+        errors_t = (
+            naive_predictions[active_t, t]
+            - true[active_t, t]
+            )
+        
+        naive_rmse_by_horizon[t] = np.sqrt(
+            np.mean(errors_t ** 2)
+            )
+        
+        naive_mae_by_horizon[t] = np.mean(
+            np.abs(errors_t)
+            )
 
-    #process data
-logging.info("Processing dataset")
-training_processed, validation_processed, test_processed, test_data_counterfactuals = process_data(pickle_map)
+    for quarter, (rmse, mae, n_active) in enumerate(
+            zip(
+                naive_rmse_by_horizon,
+                naive_mae_by_horizon,
+                naive_n_active_by_horizon,
+                ),
+            start=21,
+            ):
+        logging.info(
+            "Naive Q%d | N active %d | RMSE %.4f | MAE %.4f",
+            quarter,
+            n_active,
+            rmse,
+            mae,
+            )
 
-use_time = config["use_time"]
+    save_results(results, test_data["patient_ids"], output_dir)
 
-#chnage so intensity is actually time_covariates
-training_processed['time_covariates'] = training_processed['intensity'][:, : , np.newaxis]
-#change previous treatments
+    if run is not None:
+        run.finish()
 
-#now chnage in validation
-validation_processed['time_covariates'] = validation_processed['intensity'][:, : , np.newaxis]
-
-#change in test
-test_processed['time_covariates'] = test_processed['intensity'][:, : , np.newaxis]
-
-import logging
-import traceback
-import os
 
 if __name__ == "__main__":
-    done = False
-    tries = 0
-
-    while done == False:
-        if tries > 10:
-            done = True
-            break
-
-        try:
-            logging.info("Training model...")
-            cde_trainer = trainer(
-                run=run,
-                hidden_channels_x=config["hidden_channels_x"],
-                hidden_channels_a=config["hidden_channels_a"],
-                output_channels=config["output_channels"],
-                sample_proportion=config["sample_proportion"],
-                use_time=config["use_time"],
-                lambda_val=lambda_val,  # lambda limits how much complexity the model can have — too much and you overfit
-            )
-
-            wandb.log({"proportion": config["sample_proportion"]})
-
-            cde_trainer.fit(
-                train_data=training_processed,
-                validation_data=validation_processed,
-                epochs=config["epochs"],
-                patience=config["patience"],
-                batch_size=10,
-            )
-
-            # TO DO - issue with the way config is being read in and so the arguments
-            # for hidden channels etc are going as dict, int, which is not what it's expecting.
-            # Need to find another way to read in the YAML file.
-
-            logging.info("Testing model...")
-            cde_trainer.predict(test_data=test_processed)
-            done = True
-
-        except Exception as e:
-            print(e)
-            tries += 1
-
-    if bool(multistep) == True:
-        multidone = False
-        multitries = 0
-
-        while multidone == False:
-            if multitries > 10:
-                multidone = True
-                break
-
-            try:
-                logging.info("Fitting multistep model...")
-                cde_trainer.fit_multistep(
-                    train_data=training_processed,
-                    validation_data=validation_processed,
-                    epochs=config["epochs"],
-                    patience=config["patience"],
-                    batch_size=config["batch_size"],
-                    max_horizon=max_horizon,
-                )
-
-                logging.info("Testing multistep model...")
-                cde_trainer.multistep_predict(
-                    test_data=test_processed,
-                    max_horizon=max_horizon,
-                )
-                multidone = True
-
-            except Exception as e:
-                # To traceback where actual error takes place after multiple tries
-                print(traceback.format_exc())
-                multitries += 1
-
-    run.finish()
-
-    # Remove tmp model from file system
-    os.system("rm -rf ./tmp_models/")
+    main()
