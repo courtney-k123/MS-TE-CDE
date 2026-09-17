@@ -1,5 +1,6 @@
 # MS-TE-CDE
-Treatment Effect Neural Controlled Differential Equation (TE-CDE) was adapted from (Seedat et al., 2022) for use in multiple sclerosis. TE-CDE was chosen because of its handling irregularly spaced longitudinal data with treatment-confounder feedback.
+# Treatment Effect Neural Controlled Differential Equation (TE-CDE) was adapted from (Seedat et al., 2022) for use in multiple sclerosis. 
+TE-CDE was chosen because of its handling irregularly spaced longitudinal data with treatment-confounder feedback.
 
 The model was initially developed on cancer tumor volume data, looking at growth under different treatment options for the past 55 days, and then predicting for the following 5 days. Since in MS clinically relevant outcomes are longer-term, and patients will have longer disease durations pre-treatment, and longer time periods without any disease activity being recorded (i.e. no relapses or disability worsening), pre- and post-baseline time periods were divided into 3-monthly intervals. 
 
