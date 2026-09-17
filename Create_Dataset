@@ -1,27 +1,28 @@
-
-
-#create master df
 import pandas as pd
 import numpy as np
+import pickle
+from sklearn.model_selection import train_test_split
+import torch
+import wandb
+from scipy.special import expit
+import matplotlib.pyplot as plt
 #IMPORT PATIENTS
-#need to remove poeple getting alem/clad
-#import altogether dfs
-patients_relapses = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_relapses.csv", on_bad_lines='warn')
-patients_edss = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_edss.csv", on_bad_lines='warn')
-patients_treatments = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_postbaseline_treatments.csv", on_bad_lines='warn')
-patients_visits = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_visits.csv", on_bad_lines='warn')
-patients_age = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_age.csv", on_bad_lines='warn')
-patients_gender = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_gender.csv", on_bad_lines='warn')
-patients_disease_duration = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_disease duration.csv", on_bad_lines='warn')
-#patients_T2_CORD = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_MRI_T2_CORD.csv", on_bad_lines='warn')
-#patients_T2_BRAIN = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_MRI_T2_BRAIN.csv", on_bad_lines='warn')
-patients_follow_up = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_follow_up.csv", on_bad_lines='warn')
-#patients_T1_CORD = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_MRI_T1_CORD.csv", on_bad_lines='warn')
-#patients_T1_BRAIN = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_MRI_T1_BRAIN.csv", on_bad_lines='warn')
-patients_centre = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_centre.csv", on_bad_lines='warn')
-patients_T2 = pd.read_csv("C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/patients_MRI_T2.csv", on_bad_lines='warn')
 
-#################################################################################### RELAPSES 
+patients_relapses = pd.read_csv("")
+patients_edss = pd.read_csv("")
+patients_treatments = pd.read_csv("")
+patients_visits = pd.read_csv("")
+patients_age = pd.read_csv("")
+patients_gender = pd.read_csv("")
+patients_disease_duration = pd.read_csv("")
+patients_T2 = pd.read_csv("")
+patients_follow_up = pd.read_csv("")
+patients_centre = pd.read_csv("")
+patients_T1 = pd.read_csv("")
+
+#################################################################################### 
+# (1) RELAPSES
+#################################################################################### 
 #Patients Follow Up Converted to datetime
 patients_follow_up['START_FOLLOW_UP'] = pd.to_datetime(patients_follow_up['START_FOLLOW_UP'])
 patients_follow_up['END_FOLLOW_UP'] = pd.to_datetime(patients_follow_up['END_FOLLOW_UP'])
@@ -70,9 +71,11 @@ for data in output_data_relapses:
 
 relapse_df = pd.DataFrame(relapse_data, columns=column_names + ['PATIENT_ID'])
 
-relapse_df.to_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/relapse_df_3MOS.csv')
+relapse_df.to_csv("")
 
-#################################################################################### EDSS
+#################################################################################### 
+# (2) EDSS
+#################################################################################### 
 
 patients_edss['DATE_OF_VISIT'] = pd.to_datetime(patients_edss['DATE_OF_VISIT'])
 
@@ -120,9 +123,11 @@ for data in output_data_edss:
 
 edss_df = pd.DataFrame(edss_data, columns=column_names + ['PATIENT_ID'])
 
-edss_df.to_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/edss_df_3MOS.csv')
+edss_df.to_csv("")
 
-#################################################################################### VISIT
+#################################################################################### 
+# (3) VISITS
+#################################################################################### 
 
 patients_visits['DATE_OF_VISIT'] = pd.to_datetime(patients_visits['DATE_OF_VISIT'])
 
@@ -165,9 +170,12 @@ for data in output_data_visits:
 
 visits_df = pd.DataFrame(visit_data, columns=column_names + ['PATIENT_ID'])
 
-visits_df.to_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/visits_df_3MOS.csv')
+visits_df.to_csv("")
 
-#################################################################################### MRI - T2 ALL
+#################################################################################### 
+# (4) MRI - T2 - EXAM
+#################################################################################### 
+
 patients_T2['EXAM_DATE'] = pd.to_datetime(patients_T2['EXAM_DATE'])
 
 # Convert exam_date to datetime
@@ -211,10 +219,11 @@ for data in output_data_MRI_T2_binary:
 
 MRI_T2_Binary_df = pd.DataFrame(mri_binary_data, columns=column_names + ['PATIENT_ID'])
 
-MRI_T2_Binary_df.to_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/mri_t2_df_3MOS.csv')
+MRI_T2_Binary_df.to_csv("")
 
-################################################################################# MRI_T2 LESION COUNT 
-
+#################################################################################### 
+# (5) MRI - T2 - LESION COUNT
+#################################################################################### 
 patients_T2['EXAM_DATE'] = pd.to_datetime(patients_T2['EXAM_DATE'])
 patients_T2 = patients_T2.dropna(subset=["CUM_T2"])
 
@@ -261,14 +270,17 @@ for data in output_data_MRI_T2:
 
 MRI_T2_df = pd.DataFrame(mri_data, columns=column_names + ['PATIENT_ID'])
 
-MRI_T2_df.to_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/mri_t2_lesion_df_3MOS.csv')
+MRI_T2_df.to_csv("")
 
-#################################################################################### TREATMENT - 0,1,2,3
+#################################################################################### 
+# (6) TREATMENT - 0,1,2,3
+#################################################################################### 
 # Convert dates to datetime
 patients_treatments['START_DATE.y'] = pd.to_datetime(patients_treatments['START_DATE.y'])
 patients_treatments['END_DATE'] = pd.to_datetime(patients_treatments['END_DATE'])
 
 #need to change so alem_clad is a 3 
+#patients_treatments.EFFICACY[patients_treatments.EFFICACY == 'Alem_Clad'] = 3
 
 output_data_treatments = []
 
@@ -313,10 +325,11 @@ column_names = [f"Quarter_{i+1}" for i in range(max_quarters)]
 # Convert to DataFrame
 treatment_df = pd.DataFrame(output_data_treatments, columns=['PATIENT_ID'] + column_names).fillna(0)
 
-treatment_df.to_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/treatment_df_3MOS.csv')
+treatment_df.to_csv("")
 
-
-#################################################################################### AGE
+#################################################################################### 
+# (7) AGE
+#################################################################################### 
 patients_age['BIRTH_DATE'] = pd.to_datetime(patients_age['BIRTH_DATE'])
 patients_age['START_FOLLOW_UP'] = pd.to_datetime(patients_age['START_FOLLOW_UP'])
 patients_age['END_FOLLOW_UP'] = pd.to_datetime(patients_age['END_FOLLOW_UP'])
@@ -344,10 +357,11 @@ column_names = [f"Quarter_{i+1}" for i in range(max_quarters)]
 # Convert to DataFrame
 ages_df = pd.DataFrame(output_data_age, columns=['PATIENT_ID'] + column_names).ffill(axis=1)
 
-ages_df.to_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/age_df_3MOS.csv')
+ages_df.to_csv("")
 
-#################################################################################### GENDER
-# Merge gender information with follow-up data
+#################################################################################### 
+# (8) GENDER
+#################################################################################### 
 
 output_data_gender = []
 
@@ -372,31 +386,40 @@ column_names = [f"Quarter_{i+1}" for i in range(max_quarters)]
 # Convert to DataFrame
 gender_df = pd.DataFrame(output_data_gender, columns=['PATIENT_ID'] + column_names).ffill(axis=1)
 
-gender_df.to_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/gender_df_3MOS.csv')
+gender_df.to_csv("")
 
-#################################################################################### COUNTRY
-'''
-patients_centre = patients_centre[['PATIENT_ID', 'CENTRE']]
-merged_centre_df = patients_follow_up.merge(patients_centre, on='PATIENT_ID')
+#################################################################################### 
+# (9) COUNTRY
+#################################################################################### 
 
-output_data_centre = []
+output_data_country = []
 
-for _, row in merged_centre_df.iterrows():
-    # Generate date range
-    month_range = pd.date_range(start=row['START_FOLLOW_UP'], end=row['END_FOLLOW_UP'], freq='MS').strftime('%Y-%m')
-    #calculate age for each day of follow up period 
-    centre = row['CENTRE'] for months in month_range
-    output_data_centre.append(centre)
+for _, row in patients_centre.iterrows():
+    patient_id = row['PATIENT_ID']
+    
+    # Generate quarterly date range (first month of each quarter)
+    quarter_range = pd.date_range(start=row['START_FOLLOW_UP'], end=row['END_FOLLOW_UP'], freq='3MS').strftime('%Y-%m')
+    
+    # Generate a list of the patient's gender for each quarter
+    country_quarters = [row['country_group']] * len(quarter_range)
+    
+    # Append the result
+    output_data_country.append([patient_id] + country_quarters)
 
-# Combine into a new DataFrame
-max_months = max(len(months) for months in output_data_centre)
-column_names = [f"Day_{i+1}" for i in range(max_months)]
-#centre_df = pd.DataFrame(output_data_centre, columns=column_names).fillna(0)
+# Determine the maximum number of quarters for any patient
+max_quarters = max(len(data) - 1 for data in output_data_country)  # Exclude PATIENT_ID
 
-# Add patient ID for reference
-centre_df['PATIENT_ID'] = merged_centre_df['PATIENT_ID']
-'''
-################################################################################## DISEASE DURATION
+# Create column names for the DataFrame
+column_names = [f"Quarter_{i+1}" for i in range(max_quarters)]
+
+# Convert to DataFrame
+country_df = pd.DataFrame(output_data_country, columns=['PATIENT_ID'] + column_names).ffill(axis=1)
+
+country_df.to_csv("")
+
+#################################################################################### 
+# (9) DISEASE DURATION
+#################################################################################### 
 # Ensure SYMPTOMS_DATE is in datetime format
 patients_disease_duration['SYMPTOMS_DATE'] = pd.to_datetime(patients_disease_duration['SYMPTOMS_DATE'])
 
@@ -423,9 +446,11 @@ column_names = [f"Quarter_{i+1}" for i in range(max_quarters)]
 # Convert to DataFrame
 disease_duration_df = pd.DataFrame(output_data_disease_duration, columns=['PATIENT_ID'] + column_names).ffill(axis=1)
 
-disease_duration_df.to_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/disease_duration_df_3MOS.csv')
+disease_duration_df.to_csv("")
 
-################################################################################### All timesteps instensity
+#################################################################################### 
+# (10) ALL TIME STEP INTENSITY - CUMULATIVE VISITS
+#################################################################################### 
 #intensity will be the visits 
 # Create a copy of the visits DataFrame without the PATIENT_ID column
 cumulative_visits_df = visits_df.drop(columns=['PATIENT_ID']).astype(int)
@@ -439,321 +464,139 @@ cumulative_visits_df = cumulative_visits_df.astype(int)
 # Reinsert the PATIENT_ID column for reference
 cumulative_visits_df['PATIENT_ID'] = visits_df['PATIENT_ID']
 
-cumulative_visits_df.to_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/cumulative_visits_df_3MOS.csv')
-
+cumulative_visits_df.to_csv("")
 
 ################################################################################### Intensity covariates
 #EDSS, relapse, MRI, and centre 
 
-################################################################################### Active entries/observed timestep
-active_entries = (~np.isnan(outputs)).astype(int)
-#i think they should just all be 1 bc dead = 0 alive = 1 
+# ============================================================
+# 1. PRE-PROCESS LONGITUDINAL VARIABLES
+# ============================================================
+ID_COL = "PATIENT_ID"
 
-#CREATE 3D ARRAYS
-# Convert DataFrames to NumPy arrays
-array1 = visits_df.values
-array2 = edss_df.values
-array3 = MRI_T2_BRAIN_df.values
-array4 = MRI_T2_CORD_df.values
-array5 = age_df.values
-array6 = disease_duration_df.values
-array7 = gender_df.values
-array8 = relapse_df.values
+quarter_cols = [f"Quarter_{i}" for i in range(1, 41)]
+n_quarters = len(quarter_cols)       # 41
+n_treatments = 5                    # treatment levels 0,1,2,3,4
 
-# Stack along a new axis (axis=2 for 3D)
-covariates = np.stack([array1, array2, array3, array4], axis=2)
-intensity = 
-instensity_covariates = np.stack([array1, array2, array3, array4, array8])
 
-print(covariates)
+# ----- Relapses -----
+# Make sure values are numeric
+relapse_df[quarter_cols] = (
+    relapse_df[quarter_cols]
+    .apply(pd.to_numeric, errors="coerce"))
 
-# Combine into a dictionary
-data_dict = {
-    "Covariates": covariates,
-    "Treatments": treatment,
-    "Relapse": relapses,
-    "Intensity": instensity,
-    "Intensity_covariates": intensity_covariates
+
+# If relapse_df currently contains 0/1 indicating a relapse
+# within each quarter and you want cumulative relapse count:
+relapse_df[quarter_cols] = (
+    relapse_df[quarter_cols]
+    .fillna(0)
+    .cumsum(axis=1))
+
+
+# ----- EDSS -----
+
+# Forward-fill across time for each patient
+disability_df[quarter_cols] = (
+    disability_df[quarter_cols]
+    .ffill(axis=1))
+
+
+# ----- MRI lesions -----
+
+t2_mri_lesion_df[quarter_cols] = (
+    t2_mri_lesion_df[quarter_cols]
+    .ffill(axis=1))
+
+#active entries 
+
+quarter_cols = [f"Quarter_{i}" for i in range(1, 41)]
+
+active_rows = []
+
+for patient_id in disease_duration_df["PATIENT_ID"]:
+
+    disease_row = (
+        disease_duration_df
+        .loc[
+            disease_duration_df["PATIENT_ID"] == patient_id,
+            quarter_cols
+        ]
+        .iloc[0]
+        .to_numpy()
+    )
+
+    visit_row = (
+        visits_df
+        .loc[
+            visits_df["PATIENT_ID"] == patient_id,
+            quarter_cols
+        ]
+        .iloc[0]
+        .to_numpy()
+    )
+
+    active = np.zeros(len(quarter_cols), dtype=np.float32)
+
+    # -----------------------------------------
+    # Start of follow-up:
+    # first quarter where disease duration == 0
+    # -----------------------------------------
+    start_candidates = np.where(
+        disease_row == 0
+    )[0]
+
+    # -----------------------------------------
+    # End of follow-up:
+    # last quarter containing a recorded visit
+    # -----------------------------------------
+    visit_candidates = np.where(
+        visit_row == 1
+    )[0]
+
+    if (
+        len(start_candidates) > 0
+        and len(visit_candidates) > 0
+    ):
+        start_idx = start_candidates[0]
+        end_idx = visit_candidates[-1]
+
+        # Only activate if the last visit occurs
+        # on or after the chosen start quarter.
+        if end_idx >= start_idx:
+            active[
+                start_idx:end_idx + 1
+            ] = 1.0
+
+    active_rows.append(
+        [patient_id] + active.tolist()
+    )
+
+
+active_entries_df = pd.DataFrame(
+    active_rows,
+    columns=[
+        "PATIENT_ID",
+        *quarter_cols,
+    ],
+)
+
+
+dataframes = {
+    "age_df": age_df,
+    "cumulative_visits_df": cumulative_visits_df,
+    "disability_df": disability_df,
+    "disease_duration_df": disease_duration_df,
+    "gender_df": gender_df,
+    "relapse_df": relapse_df,
+    "t2_mri_lesion_df": t2_mri_lesion_df,
+    "treatment_df": treatment_df,
+    "visits_df": visits_df,
+    "active_entries_df": active_entries_df,
 }
 
+with open("ms_dataframes.pkl", "wb") as f:
+    pickle.dump(dataframes, f)
+    
+np.save('ms_dataframes.npy', dataframes) 
 
-
-
-
-
-
-from sklearn.model_selection import train_test_split
-import torch
-import pandas as pd
-import numpy as np
-import wandb
-from scipy.special import expit
-import matplotlib.pyplot as plt
-import seaborn as sns
-#from src.utils.data_utils import process_data, read_from_file, write_to_file
-
-cumulative_visits_df = pd.read_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/cumulative_visits_df_3MOS.csv')
-relapse_df = pd.read_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/relapse_df_3MOS.csv')
-disability_df = pd.read_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/edss_df_3MOS.csv')
-visits_df = pd.read_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/visits_df_3MOS.csv')
-#t2_mri_scan_df = pd.read_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/mri_t2_df_3MOS.csv')
-t2_mri_lesion_df = pd.read_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/mri_t2_lesion_df_3MOS.csv')
-treatment_df = pd.read_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/treatment_df_3MOS.csv')
-age_df = pd.read_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/age_df_3MOS.csv')
-gender_df = pd.read_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/gender_df_3MOS.csv')
-disease_duration_df = pd.read_csv('C:/Users/ck624/my_AI_projects/timeseries/TESAR-CDE/data/transformed/disease_duration_df_3MOS.csv')
-
-#remove random column
-del cumulative_visits_df['Unnamed: 0']
-del relapse_df['Unnamed: 0']
-del disability_df['Unnamed: 0']
-del visits_df['Unnamed: 0']
-#del t2_mri_scan_df['Unnamed: 0']
-del t2_mri_lesion_df['Unnamed: 0']
-del treatment_df['Unnamed: 0']
-del age_df['Unnamed: 0']
-del gender_df['Unnamed: 0']
-del disease_duration_df['Unnamed: 0']
-
-#edit gender so numerical
-gender_df = gender_df.replace('M', 0)
-gender_df = gender_df.replace('F', 1)
-
-#fill EDSS columns with foward fill post-treatment (21-40)
-filled_df = disability_df.ffill(axis=1)
-disability_df.iloc[:, 20:40] = filled_df.iloc[:, 20:40] 
-
-#fill MRI columns with foward fill post-treatment 
-filled_df = t2_mri_lesion_df.ffill(axis=1)
-t2_mri_lesion_df.iloc[:, 20:40] = filled_df.iloc[:, 20:40] 
-
-#############################################
-# Part 1 - Data Formatting (Generation)
-
-########
-
-###########
-final_df_mri_t2 = t2_mri_lesion_df.copy()
-final_df_disability = disability_df.copy()
-
-# Iterate through each patient and day to fill all values
-# Process for forward filling
-for patient in final_df_disability.index:
-    for month in final_df_disability.columns:
-        if pd.notna(final_df_disability.loc[patient, month]):
-            if pd.isna(final_df_mri_t2.loc[patient, month]):
-                prev_mri_month = final_df_mri_t2.loc[patient, :month].last_valid_index()
-                if prev_mri_month:
-                    final_df_mri_t2.loc[patient, month] = final_df_mri_t2.loc[patient, prev_mri_month]
-        elif pd.notna(final_df_mri_t2.loc[patient, month]):
-            if pd.isna(final_df_disability.loc[patient, month]):
-                prev_edss_month = final_df_disability.loc[patient, :month].last_valid_index()
-                if prev_edss_month:
-                    final_df_disability.loc[patient, month] = final_df_disability.loc[patient, prev_edss_month]
-
-
-#sort patients into training validation and testing
-# Step 1: Get unique IDs
-unique_ids = age_df['PATIENT_ID'].unique()
-
-# Step 2: Split IDs into train and temp (temp will later be split into val and test)
-train_ids, temp_ids = train_test_split(unique_ids, test_size=0.4, random_state=42)
-
-# Step 3: Split temp_ids into validation and test
-val_ids, test_ids = train_test_split(temp_ids, test_size=0.5, random_state=42)
-
-# Step 4: Create Training Set
-
-#for current covariates (1989, 40, 6)
-# Convert each to clean NumPy array with numeric dtype
-disability_train = final_df_disability[final_df_disability['PATIENT_ID'].isin(train_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-relapse_train = relapse_df[relapse_df['PATIENT_ID'].isin(train_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-mri_t2_train = final_df_mri_t2[final_df_mri_t2['PATIENT_ID'].isin(train_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-age_train = age_df[age_df['PATIENT_ID'].isin(train_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-duration_train = disease_duration_df[disease_duration_df['PATIENT_ID'].isin(train_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-gender_train = gender_df[gender_df['PATIENT_ID'].isin(train_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-
-#current covariates 
-current_covariates_train = np.stack([
-    disability_train,
-    relapse_train,
-    mri_t2_train,
-    age_train,
-    duration_train,
-    gender_train
-], axis=2)
-
-#time covariates  = intensity and intensity is how many visits someone has had
-time_covariates_train = cumulative_visits_df[cumulative_visits_df['PATIENT_ID'].isin(train_ids)]
-del time_covariates_train['PATIENT_ID']
-time_covariates_train = time_covariates_train.to_numpy()
-time_covariates_train = time_covariates_train[:, :, np.newaxis]
-
-#previous treatments
-treatment_train = treatment_df[treatment_df['PATIENT_ID'].isin(train_ids)]
-del treatment_train['PATIENT_ID']
-num_treatments = 4
-treatments_train = np.zeros((1989, 40, 4), dtype=int)
-
-for patient_idx, row in enumerate(treatment_train.values):
-    for time_idx, treatment in enumerate(row):
-        if 0 <= treatment < num_treatments:  # Ensure valid treatment index
-            treatments_train[patient_idx, time_idx, treatment] = 1
-
-previous_treatments_train = treatments_train[:,:39,:]
-
-#start with output as relapse
-#outputs
-outputs_train = relapse_train
-outputs_train = outputs_train[:,:,np.newaxis]
-
-#active entries - should be one from the first relapse onwards i think?
-active_entries_train = np.ones((1989, 40, 1), dtype=int)
-
-#current treatments
-current_treatments_train = treatments_train[:,:40,:]
-
-#for validation
-#for current covariates
-# Convert each to clean NumPy array with numeric dtype
-disability_val = final_df_disability[final_df_disability['PATIENT_ID'].isin(val_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-relapse_val = relapse_df[relapse_df['PATIENT_ID'].isin(val_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-mri_t2_val = final_df_mri_t2[final_df_mri_t2['PATIENT_ID'].isin(val_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-age_val = age_df[age_df['PATIENT_ID'].isin(val_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-duration_val = disease_duration_df[disease_duration_df['PATIENT_ID'].isin(val_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-gender_val = gender_df[gender_df['PATIENT_ID'].isin(val_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-
-#current covariates 
-current_covariates_val = np.stack([
-    disability_val,
-    relapse_val,
-    mri_t2_val,
-    age_val,
-    duration_val,
-    gender_val
-], axis=2)
-
-#time covariates  = intensity 
-#and intensity is how many visits someone has had
-
-time_covariates_val = cumulative_visits_df[cumulative_visits_df['PATIENT_ID'].isin(val_ids)]
-del time_covariates_val['PATIENT_ID']
-time_covariates_val = time_covariates_val.to_numpy()
-time_covariates_val = time_covariates_val[:, :, np.newaxis]
-
-#previous treatments
-treatment_val = treatment_df[treatment_df['PATIENT_ID'].isin(val_ids)]
-del treatment_val['PATIENT_ID']
-num_treatments = 4
-treatments_val = np.zeros((663, 40, 4), dtype=int)
-
-for patient_idx, row in enumerate(treatment_val.values):
-    for time_idx, treatment in enumerate(row):
-        if 0 <= treatment < num_treatments:  # Ensure valid treatment index
-            treatments_val[patient_idx, time_idx, treatment] = 1
-
-previous_treatments_val = treatments_val[:,:39,:]
-
-#start with output as relapse
-
-#outputs
-outputs_val = relapse_val
-outputs_val = outputs_val[:,:,np.newaxis]
-
-#active entries - should be one from the first relapse onwards i think?
-active_entries_val = np.ones((663, 40, 1), dtype=int)
-
-#current treatments
-current_treatments_val = treatments_val[:,:40,:]
-
-
-#for testing
-#for current covariates
-disability_test = final_df_disability[final_df_disability['PATIENT_ID'].isin(test_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-relapse_test = relapse_df[relapse_df['PATIENT_ID'].isin(test_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-mri_t2_test = final_df_mri_t2[final_df_mri_t2['PATIENT_ID'].isin(test_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-age_test = age_df[age_df['PATIENT_ID'].isin(test_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-duration_test = disease_duration_df[disease_duration_df['PATIENT_ID'].isin(test_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-gender_test = gender_df[gender_df['PATIENT_ID'].isin(test_ids)].drop(columns=['PATIENT_ID']).to_numpy(dtype=np.float32)
-
-
-#current covariates 
-current_covariates_test = np.stack([
-    disability_test,
-    relapse_test,
-    mri_t2_test,
-    age_test,
-    duration_test,
-    gender_test
-], axis=2)
-
-#time covariates  = intensity and intensity is how many visits someone has had
-time_covariates_test = cumulative_visits_df[cumulative_visits_df['PATIENT_ID'].isin(test_ids)]
-del time_covariates_test['PATIENT_ID']
-time_covariates_test = time_covariates_test.to_numpy()
-time_covariates_test = time_covariates_test[:, :, np.newaxis]
-
-#previous treatments
-treatment_test = treatment_df[treatment_df['PATIENT_ID'].isin(test_ids)]
-del treatment_test['PATIENT_ID']
-num_treatments = 4
-treatments_test = np.zeros((664, 40, 4), dtype=int)
-
-for patient_idx, row in enumerate(treatment_test.values):
-    for time_idx, treatment in enumerate(row):
-        if 0 <= treatment < num_treatments:  # Ensure valid treatment index
-            treatments_test[patient_idx, time_idx, treatment] = 1
-
-previous_treatments_test = treatments_test[:,:39,:]
-
-#start with output as relapse
-#outputs
-outputs_test = relapse_test
-outputs_test = outputs_test[:,:,np.newaxis]
-
-#active entries - should be one from the first relapse onwards i think?
-active_entries_test = np.ones((664, 40, 1), dtype=int)
-
-#current treatments
-current_treatments_test = treatments_test[:,:40,:]
-
-
-#"current covariates",  - 40 timepoints
-#"time covariates",  - 40 timepoints
-#"previous treatments" - 39 time points
-#"outputs", - 40 timepoints
-#"active entries", - 40 timepoints
-#"current treatments" - 40 timepoints
-
-
-test_data = {'time_covariates': time_covariates_test,
-             'current_covariates': current_covariates_test,
-             'previous_treatments': previous_treatments_test,
-             'current_treatments': current_treatments_test,
-             'outputs': outputs_test,
-             'active_entries': active_entries_test}
-
-
-training_data = {'time_covariates': time_covariates_train,
-             'current_covariates': current_covariates_train,
-             'previous_treatments': previous_treatments_train,
-             'current_treatments': current_treatments_train,
-             'outputs': outputs_train,
-             'active_entries': active_entries_train}
-
-validation_data = {'time_covariates': time_covariates_val,
-             'current_covariates': current_covariates_val,
-             'previous_treatments': previous_treatments_val,
-             'current_treatments': current_treatments_val,
-             'outputs': outputs_val,
-             'active_entries': active_entries_val}
-
-pickle_map = {'training_data': training_data,
-              'validation_data': validation_data,
-              'test_data': test_data}
-
-#want to put this in a file to save
-import numpy as np
-np.save('pickle_map_ms_TECDE.npy', pickle_map) 
-
-pickle_map = np.load('pickle_map_ms_TECDE.npy', allow_pickle=True).item()
