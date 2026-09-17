@@ -1,477 +1,387 @@
-#TECDE data utils
-import pickle
-import random
+"""Utilities for the MS TE-CDE experiment.
+
+Experiment definition
+---------------------
+Q1-Q20  : observed history used by the CDE encoder
+Q21-Q40 : future period to predict
+Q41     : deliberately unused in this experiment
+
+The expected input is a dictionary of pandas DataFrames with keys:
+    age_df, cumulative_visits_df, disability_df, disease_duration_df,
+    gender_df, relapse_df, t2_mri_lesion_df, treatment_df, visits_df
+
+Each DataFrame must contain PATIENT_ID and Quarter_1 ... Quarter_41.
+relapse_df is expected to contain CUMULATIVE relapse counts.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Iterable, Mapping, Tuple
 
 import numpy as np
-import torch
-import torchcde
+import pandas as pd
+
+ID_COL = "PATIENT_ID"
+QUARTER_COLS = [f"Quarter_{i}" for i in range(1, 41)]
+HISTORY_LENGTH = 20
+FORECAST_LENGTH = 20
+N_TREATMENTS = 5
+
+REQUIRED_DF_KEYS = (
+    "age_df",
+    "cumulative_visits_df",
+    "disability_df",
+    "disease_duration_df",
+    "gender_df",
+    "relapse_df",
+    "t2_mri_lesion_df",
+    "treatment_df",
+    "visits_df",
+    "active_entries_df",
+)
 
 
-def get_processed_data(raw_sim_data, scaling_params):
+@dataclass
+class PreprocessingParams:
+    """Training-set-only preprocessing parameters."""
+
+    edss_fill_value: float
+    mri_fill_value: float
+    feature_means: np.ndarray
+    feature_stds: np.ndarray
+    continuous_feature_indices: Tuple[int, ...]
+
+
+FEATURE_NAMES = (
+    "edss",
+    "cumulative_relapse",
+    "t2_mri_lesions",
+    "age",
+    "disease_duration",
+    "gender",
+    "cumulative_visits",
+    "edss_observed",
+    "mri_observed",
+    "active_entry",
+)
+
+# Everything except gender and the two missingness indicators is standardised.
+CONTINUOUS_FEATURE_INDICES = (0, 1, 2, 3, 4, 6)
+
+
+def _quarter_values(df: pd.DataFrame, ids: Iterable, dtype=np.float32) -> np.ndarray:
+    """Return rows in exactly the requested patient order."""
+    indexed = df.set_index(ID_COL)
+    return indexed.loc[list(ids), QUARTER_COLS].to_numpy(dtype=dtype)
+
+
+def validate_dataframes(dataframes: Mapping[str, pd.DataFrame]) -> None:
+    """Fail early if the longitudinal tables are not compatible."""
+    missing = [key for key in REQUIRED_DF_KEYS if key not in dataframes]
+    if missing:
+        raise KeyError(f"Missing DataFrames: {missing}")
+
+    reference = dataframes["age_df"]
+    expected_ids = set(reference[ID_COL])
+
+    if reference[ID_COL].duplicated().any():
+        raise ValueError("age_df contains duplicate PATIENT_ID values.")
+
+    for name in REQUIRED_DF_KEYS:
+        df = dataframes[name]
+        required_cols = [ID_COL, *QUARTER_COLS]
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"{name} is missing columns: {missing_cols}")
+        if df[ID_COL].duplicated().any():
+            raise ValueError(f"{name} contains duplicate PATIENT_ID values.")
+        if set(df[ID_COL]) != expected_ids:
+            raise ValueError(f"{name} does not contain exactly the same patient IDs as age_df.")
+
+    # Validate treatment coding.
+    treatments = dataframes["treatment_df"][QUARTER_COLS].to_numpy()
+    finite_treatments = treatments[pd.notna(treatments)]
+    invalid_treatments = np.setdiff1d(np.unique(finite_treatments), np.arange(N_TREATMENTS))
+    if len(invalid_treatments):
+        raise ValueError(
+            f"treatment_df contains values outside 0..{N_TREATMENTS - 1}: "
+            f"{invalid_treatments.tolist()}"
+        )
+
+    # relapse_df should already be cumulative and therefore non-decreasing.
+    relapse = dataframes["relapse_df"][QUARTER_COLS].apply(pd.to_numeric, errors="coerce")
+    relapse_diff = relapse.diff(axis=1).iloc[:, 1:]
+    if (relapse_diff < 0).any().any():
+        raise ValueError(
+            "relapse_df is not non-decreasing across quarters. This pipeline expects "
+            "cumulative relapse counts, not quarterly relapse indicators."
+        )
+
+
+def split_patient_ids(
+    patient_ids,
+    train_fraction=0.60,
+    val_fraction=0.20,
+    test_fraction=0.20,
+    random_state=42,
+):
     """
-    It takes the raw simulation data and the scaling parameters, and returns a dictionary with the
-    following keys:
+    Randomly split patient IDs into train / validation / test sets.
 
-    - `current_covariates`: the current covariates (cancer volume and patient type)
-    - `time_covariates`: the time covariates (intensity)
-    - `previous_treatments`: the previous treatments (one-hot encoded)
-    - `current_treatments`: the current treatments (one-hot encoded)
-    - `outputs`: the outputs (cancer volume)
-    - `active_entries`: the active entries (1 if the patient is still alive, 0 otherwise)
-    - `unscaled_outputs`: the unscaled outputs (cancer volume)
-    - `input_means`: the input means (cancer volume, patient type, chemo application, radio application)
-    - `inputs_stds`: the input standard deviations (cancer volume,
-
-    raw_sim_data (dict): the dataframe containing the simulation data
-    scaling_params (tuple): the mean and standard deviation of the cancer volume and patient types
-
-    CODE ADAPTED FROM: https://github.com/ioanabica/Counterfactual-Recurrent-Network
+    Default:
+        60% train
+        20% validation
+        20% test
     """
-    mean, std = scaling_params
 
-    horizon = 1
-    offset = 1
+    if not np.isclose(
+        train_fraction + val_fraction + test_fraction,
+        1.0
+    ):
+        raise ValueError(
+            "train_fraction + val_fraction + test_fraction must equal 1."
+        )
 
-    mean["chemo_application"] = 0
-    mean["radio_application"] = 0
-    std["chemo_application"] = 1
-    std["radio_application"] = 1
+    patient_ids = np.asarray(patient_ids)
 
-    input_means = mean[
-        ["cancer_volume", "patient_types", "chemo_application", "radio_application"]
-    ].values.flatten()
-    input_stds = std[
-        ["cancer_volume", "patient_types", "chemo_application", "radio_application"]
-    ].values.flatten()
+    rng = np.random.default_rng(random_state)
 
-    # Continuous values
-    cancer_volume = (raw_sim_data["cancer_volume"] - mean["cancer_volume"]) / std[
-        "cancer_volume"
+    shuffled_ids = patient_ids.copy()
+    rng.shuffle(shuffled_ids)
+
+    n = len(shuffled_ids)
+
+    n_train = int(round(n * train_fraction))
+    n_val = int(round(n * val_fraction))
+
+    train_ids = shuffled_ids[:n_train]
+
+    val_ids = shuffled_ids[
+        n_train:n_train + n_val
     ]
-    patient_types = (raw_sim_data["patient_types"] - mean["patient_types"]) / std[
-        "patient_types"
+
+    test_ids = shuffled_ids[
+        n_train + n_val:
     ]
 
-    patient_types = np.stack(
-        [patient_types for t in range(cancer_volume.shape[1])],
-        axis=1,
+    return train_ids, val_ids, test_ids
+
+
+def _prepare_sparse_history(
+    df: pd.DataFrame,
+    ids: Iterable,
+    fill_value: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Forward-fill sparse measurements within Q1-Q20 and retain an observation mask."""
+    raw = _quarter_values(df, ids, dtype=np.float32)[:, :HISTORY_LENGTH]
+    observed = (~np.isnan(raw)).astype(np.float32)
+    filled = pd.DataFrame(raw).ffill(axis=1).to_numpy(dtype=np.float32)
+    filled = np.where(np.isnan(filled), fill_value, filled)
+    return filled, observed
+
+
+def fit_preprocessing_params(
+    dataframes: Mapping[str, pd.DataFrame],
+    train_ids: Iterable,
+) -> PreprocessingParams:
+    """Fit imputation and standardisation parameters using training Q1-Q20 only."""
+    train_ids = list(train_ids)
+
+    edss_train = _quarter_values(dataframes["disability_df"], train_ids)[:, :HISTORY_LENGTH]
+    mri_train = _quarter_values(dataframes["t2_mri_lesion_df"], train_ids)[:, :HISTORY_LENGTH]
+
+    edss_fill = float(np.nanmedian(edss_train))
+    mri_fill = float(np.nanmedian(mri_train))
+
+    # Build an unscaled training feature tensor first.
+    features = _build_history_features(
+        dataframes=dataframes,
+        ids=train_ids,
+        edss_fill_value=edss_fill,
+        mri_fill_value=mri_fill,
     )
 
-    # Continuous values
-    intensity = raw_sim_data["intensity"]
+    means = np.zeros(len(FEATURE_NAMES), dtype=np.float32)
+    stds = np.ones(len(FEATURE_NAMES), dtype=np.float32)
 
-    # Binary application
-    chemo_application = raw_sim_data["chemo_application"]
-    radio_application = raw_sim_data["radio_application"]
-    sequence_lengths = raw_sim_data["sequence_lengths"]
+    for idx in CONTINUOUS_FEATURE_INDICES:
+        values = features[:, :, idx]
+        means[idx] = np.mean(values)
+        std = np.std(values)
+        stds[idx] = std if std > 1e-8 else 1.0
 
-    # Convert treatments to one-hot encoding
+    return PreprocessingParams(
+        edss_fill_value=edss_fill,
+        mri_fill_value=mri_fill,
+        feature_means=means,
+        feature_stds=stds,
+        continuous_feature_indices=CONTINUOUS_FEATURE_INDICES,
+    )
 
-    treatments = np.concatenate(
+
+def _build_history_features(
+    dataframes: Mapping[str, pd.DataFrame],
+    ids: Iterable,
+    edss_fill_value: float,
+    mri_fill_value: float,
+) -> np.ndarray:
+    ids = list(ids)
+
+    edss, edss_observed = _prepare_sparse_history(
+        dataframes["disability_df"], ids, edss_fill_value
+    )
+    mri, mri_observed = _prepare_sparse_history(
+        dataframes["t2_mri_lesion_df"], ids, mri_fill_value
+    )
+    
+
+    relapse = _quarter_values(dataframes["relapse_df"], ids)[:, :HISTORY_LENGTH]
+    age = _quarter_values(dataframes["age_df"], ids)[:, :HISTORY_LENGTH]
+    disease_duration = _quarter_values(dataframes["disease_duration_df"], ids)[:, :HISTORY_LENGTH]
+    gender = _quarter_values(dataframes["gender_df"], ids)[:, :HISTORY_LENGTH]
+    cumulative_visits = _quarter_values(dataframes["cumulative_visits_df"], ids)[:, :HISTORY_LENGTH]
+    active_entry = _quarter_values(dataframes["active_entries_df"], ids, dtype=np.float32)[:, :HISTORY_LENGTH]
+
+    # These should be fully observed for model input. If a source table contains a rare NA,
+    # fail visibly rather than silently leaking an arbitrary value into the model.
+    dense = {
+        "relapse": relapse,
+        "age": age,
+        "disease_duration": disease_duration,
+        "gender": gender,
+        "cumulative_visits": cumulative_visits,
+        "active_entry": active_entry,
+    }
+    for name, arr in dense.items():
+        if np.isnan(arr).any():
+            raise ValueError(f"{name} contains missing values within Q1-Q20.")
+
+    return np.stack(
         [
-            chemo_application[:, :-offset, np.newaxis],
-            radio_application[:, :-offset, np.newaxis],
+            edss,
+            relapse,
+            mri,
+            age,
+            disease_duration,
+            gender,
+            cumulative_visits,
+            edss_observed,
+            mri_observed,
+            active_entry,
         ],
         axis=-1,
+    ).astype(np.float32)
+
+
+def build_ms_dataset(
+    dataframes: Mapping[str, pd.DataFrame],
+    ids: Iterable,
+    params: PreprocessingParams,
+) -> Dict[str, np.ndarray]:
+    """Build one fixed-window dataset for the Q1-Q20 -> Q21-Q40 experiment."""
+    ids = np.asarray(list(ids))
+
+    history_covariates = _build_history_features(
+        dataframes=dataframes,
+        ids=ids,
+        edss_fill_value=params.edss_fill_value,
+        mri_fill_value=params.mri_fill_value,
     )
 
-    one_hot_treatments = np.zeros(shape=(treatments.shape[0], treatments.shape[1], 4))
-    for patient_id in range(treatments.shape[0]):
-        for timestep in range(treatments.shape[1]):
-            if (
-                treatments[patient_id][timestep][0] == 0
-                and treatments[patient_id][timestep][1] == 0
-            ):
-                one_hot_treatments[patient_id][timestep] = [1, 0, 0, 0]
-            elif (
-                treatments[patient_id][timestep][0] == 1
-                and treatments[patient_id][timestep][1] == 0
-            ):
-                one_hot_treatments[patient_id][timestep] = [0, 1, 0, 0]
-            elif (
-                treatments[patient_id][timestep][0] == 0
-                and treatments[patient_id][timestep][1] == 1
-            ):
-                one_hot_treatments[patient_id][timestep] = [0, 0, 1, 0]
-            elif (
-                treatments[patient_id][timestep][0] == 1
-                and treatments[patient_id][timestep][1] == 1
-            ):
-                one_hot_treatments[patient_id][timestep] = [0, 0, 0, 1]
+    for idx in params.continuous_feature_indices:
+        history_covariates[:, :, idx] = (
+            history_covariates[:, :, idx] - params.feature_means[idx]
+        ) / params.feature_stds[idx]
 
-    one_hot_previous_treatments = one_hot_treatments[:, :-1, :]
+    treatment = _quarter_values(dataframes["treatment_df"], ids, dtype=np.float32)
+    if np.isnan(treatment[:, :40]).any():
+        raise ValueError("treatment_df contains missing treatment values within Q1-Q40.")
+    treatment = treatment.astype(np.int64)
+    treatment_one_hot = np.eye(N_TREATMENTS, dtype=np.float32)[treatment]
 
-    current_covariates = np.concatenate(
-        [
-            cancer_volume[:, :-offset, np.newaxis],
-            patient_types[:, :-offset, np.newaxis],
-        ],
-        axis=-1,
-    )
+    history_treatments = treatment_one_hot[:, :HISTORY_LENGTH, :]
 
-    time_covariates = np.concatenate(
-        [
-            intensity[:, :-offset, np.newaxis],
-        ],
-        axis=-1,
-    )
-    outputs = cancer_volume[:, horizon:, np.newaxis]
+    # Decoder path contains the Q20 boundary followed by Q21-Q40.
+    # This gives 21 control points and therefore 20 future intervals.
+    future_treatments = treatment_one_hot[:, HISTORY_LENGTH - 1 : HISTORY_LENGTH + FORECAST_LENGTH, :]
 
-    output_means = mean[["cancer_volume"]].values.flatten()[
-        0
-    ]  # because we only need scalars here
-    output_stds = std[["cancer_volume"]].values.flatten()[0]
+    cumulative_relapse = _quarter_values(dataframes["relapse_df"], ids, dtype=np.float32)
+    baseline_relapse = cumulative_relapse[:, HISTORY_LENGTH - 1]
+    future_cumulative = cumulative_relapse[:, HISTORY_LENGTH : HISTORY_LENGTH + FORECAST_LENGTH]
+    
+    future_increments = np.diff(np.concatenate([baseline_relapse[:, None], future_cumulative], axis=1), axis=1,).astype(np.float32)
 
-    # Add active entires
-    active_entries = np.zeros(outputs.shape)
+    if (future_increments < 0).any():
+        raise ValueError("Derived relapse increments contain negative values.")
 
-    for i in range(sequence_lengths.shape[0]):
-        sequence_length = int(sequence_lengths[i])
-        active_entries[i, :sequence_length, :] = 1
+    active_entries = _quarter_values(dataframes["active_entries_df"], ids, dtype=np.float32)
+    history_active = active_entries[:, :HISTORY_LENGTH]
+    future_active = active_entries[:, HISTORY_LENGTH:HISTORY_LENGTH + FORECAST_LENGTH]
 
-    raw_sim_data["current_covariates"] = current_covariates
-    raw_sim_data["time_covariates"] = time_covariates
-    raw_sim_data["previous_treatments"] = one_hot_previous_treatments
-    raw_sim_data["current_treatments"] = one_hot_treatments
-    raw_sim_data["outputs"] = outputs
-    raw_sim_data["active_entries"] = active_entries
+    history_time_1d = np.linspace(0.0, 1.0, HISTORY_LENGTH, dtype=np.float32)
+    history_time = np.broadcast_to(
+        history_time_1d[None, :, None],
+        (len(ids), HISTORY_LENGTH, 1),
+    ).copy()
 
-    raw_sim_data["unscaled_outputs"] = (
-        outputs * std["cancer_volume"] + mean["cancer_volume"]
-    )
-    raw_sim_data["input_means"] = input_means
-    raw_sim_data["inputs_stds"] = input_stds
-    raw_sim_data["output_means"] = output_means
-    raw_sim_data["output_stds"] = output_stds
+    future_time_1d = np.linspace(0.0, 1.0, FORECAST_LENGTH + 1, dtype=np.float32)
+    future_time = np.broadcast_to(
+        future_time_1d[None, :, None],
+        (len(ids), FORECAST_LENGTH + 1, 1),
+    ).copy()
 
-    return raw_sim_data
+    return {
+        "patient_ids": ids,
+        "history_covariates": history_covariates.astype(np.float32),
+        "history_treatments": history_treatments.astype(np.float32),
+        "history_time": history_time.astype(np.float32),
+        "future_treatments": future_treatments.astype(np.float32),
+        "future_time": future_time.astype(np.float32),
+        "baseline_relapse": baseline_relapse.astype(np.float32),
+        "future_cumulative_relapse": future_cumulative.astype(np.float32),
+        "future_relapse_increments": future_increments.astype(np.float32),
+        "history_active": history_active.astype(np.float32),
+        "future_active": future_active.astype(np.float32),
+    }
+
+
+def build_train_val_test(
+    dataframes: Mapping[str, pd.DataFrame],
+    random_state: int = 42,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], PreprocessingParams]:
+    """Validate, split patients, fit training preprocessing, and build all three datasets."""
+    validate_dataframes(dataframes)
+
+    patient_ids = dataframes["age_df"][ID_COL].to_numpy()
+    train_ids, val_ids, test_ids = split_patient_ids(
+    patient_ids,
+    train_fraction=0.60,
+    val_fraction=0.20,
+    test_fraction=0.20,
+    random_state=random_state,
+)
+
+    params = fit_preprocessing_params(dataframes, train_ids)
+
+    training_data = build_ms_dataset(dataframes, train_ids, params)
+    validation_data = build_ms_dataset(dataframes, val_ids, params)
+    test_data = build_ms_dataset(dataframes, test_ids, params)
+
+    return training_data, validation_data, test_data, params
+
+
+def describe_dataset(name: str, data: Mapping[str, np.ndarray]) -> None:
+    print(f"\n{name}")
+    for key, value in data.items():
+        if hasattr(value, "shape"):
+            print(f"  {key:30s} {value.shape}")
 
 
 def process_data(pickle_map):
-    """
-    Returns processed train, val, test data from pickle map
-
-    Args:
-    pickle_map (dict): dict containing data from pickle map
-
-    Returns:
-    training_processed (np array): training data processed numpy
-    validation_processed (np array): validation data processed numpy
-    test_processed (np array): test data processed numpy
-    """
-    # load data from pickle_map
-    #for cancer
-    #training_data = pickle_map["training_data"]
-    #validation_data = pickle_map["validation_data"]
-    #test_data = pickle_map["test_data"]
-    #scaling_data = pickle_map["scaling_data"]
-    #for MS
-    training_processed = pickle_map["training_data"]
-    validation_processed = pickle_map["validation_data"]
-    test_processed = pickle_map["test_data_factuals"]
-    test_data_counterfactuals = pickle_map["test_data"]
-    
-    #need to chnage how we process it if we want to scale it but the above is for cancer simulated data
-    #training_processed = get_processed_data(training_data, scaling_data)
-    #validation_processed = get_processed_data(validation_data, scaling_data)
-    #test_processed = get_processed_data(test_data, scaling_data)
-
-    return training_processed, validation_processed, test_processed, test_data_counterfactuals
-
-
-def get_treatment_indices(tr):
-    """
-    It takes in a treatment matrix and returns the indices of the treated and untreated patients
-
-    tr: the treatment matrix
-    return: The indices of the treated and untreated patients.
-    """
-    all_counts = []
-
-    for i in range(tr.shape[0]):
-        count = 0
-        for j in range(tr.shape[1]):
-            comparison = tr[i][j] == np.array([1, 0, 0, 0])
-            if comparison.all() == True:
-                count += 1
-
-        all_counts.append(count)
-
-    untreated_indices = []
-    treated_indices = []
-
-    for idx, sum_vals in enumerate(all_counts):
-        if sum_vals == 59:
-            untreated_indices.append(idx)
-        else:
-            treated_indices.append(idx)
-
-    return treated_indices, untreated_indices
-
-
-def process_counterfactual_seq_test_data(data_map, states, projection_horizon): #A data processing pipeline to format sequences into the right multistep shape
-    # CODE ADAPTED FROM: https://github.com/ioanabica/Counterfactual-Recurrent-Network
-    #This function restructures your dataset to prepare it for multistep counterfactual forecasting, based on a given hidden state (e.g. from the encoder). Here's the logic step-by-step:
-        #projection_horizon: how many future time steps you're predicting
-        #in trainer.py the projection horizon just ends up being the max horizon 
-        #states = encoders latent states
-    outputs = data_map["outputs"] # outputs: observed outcomes (e.g., relapse/no relapse)
-    current_treatments = data_map["current_treatments"] # treatments: current and previous treatment actions
-    previous_treatments = data_map["previous_treatments"]
-    current_covariates = data_map["current_covariates"]#covariates: patient features at each time step
-
-    num_patient_points = outputs.shape[0] # The number of patients (or individual time-series units).
-
-    # allocate empty containers for the projected sequences - All of these will hold the forecasted future sequences.
-    seq2seq_state_inits = np.zeros((num_patient_points, states.shape[-1])) #states: latent/hidden states from the model — usually final encoder outputs
-    
-    seq2seq_previous_treatments = np.zeros((num_patient_points, projection_horizon, previous_treatments.shape[-1]),)
-    seq2seq_current_treatments = np.zeros((num_patient_points, projection_horizon, current_treatments.shape[-1]),)
-    seq2seq_current_covariates = np.zeros((num_patient_points, projection_horizon, current_covariates.shape[-1]),)
-    seq2seq_outputs = np.zeros((num_patient_points, projection_horizon, outputs.shape[-1]),)
-    seq2seq_active_entries = np.zeros((num_patient_points, projection_horizon, 1))
-    seq2seq_sequence_lengths = np.zeros(num_patient_points)
-
-    #Loop Over Patients
-    for i in range(num_patient_points):
-        seq_length = 20  # int(sequence_lengths[i])#
-        seq2seq_state_inits[i] = states[i, 19] #the final encoder state → starting point for generating counterfactual futures.
-        seq2seq_active_entries[i] = np.ones(shape=(projection_horizon, 1))#Assumes all future entries are active (no missing data).
-
-        seq2seq_previous_treatments[i] = previous_treatments[i, seq_length - 1 : seq_length + projection_horizon - 1, :]#grabs previous_treatments ending at t=19, extending into the next horizon
-        seq2seq_current_treatments[i] = current_treatments[i, seq_length : seq_length + projection_horizon, :]#current_treatments from t=20 → 20 + horizon - 1
-            #Used as the counterfactual actions during prediction
-        seq2seq_outputs[i] = outputs[i, seq_length : seq_length + projection_horizon, :]#Future outcomes (if available) — useful for evaluation
-        seq2seq_sequence_lengths[i] = projection_horizon #Just metadata — how long the generated sequence is.
-        seq2seq_current_covariates[i] = np.repeat([current_covariates[i, seq_length - 1]], projection_horizon, axis=0, )#Repeats the last known covariate (t=19) across the future horizon.
-        #So we assume static covariates into the future (reasonable for many clinical cases).
-
-    # Package outputs - data_map: dictionary of original test data (covariates, treatments, outcomes, etc.)
-    #Returns a dictionary of structured sequences ready for multistep model input:
-    seq2seq_data_map = {
-        "init_state": seq2seq_state_inits, #Also includes init_state so the decoder can start predicting
-        "previous_treatments": seq2seq_previous_treatments,
-        "current_treatments": seq2seq_current_treatments,
-        "current_covariates": seq2seq_current_covariates,
-        "outputs": seq2seq_outputs,
-        "sequence_lengths": seq2seq_sequence_lengths,
-        "active_entries": seq2seq_active_entries,
-        "unscaled_outputs": seq2seq_outputs * data_map["output_stds"]
-        + data_map["output_means"],
-        "output_means": data_map["output_means"],
-        "output_stds": data_map["output_stds"],
-    }
-
-    return seq2seq_data_map
-
-
-def process_seq_data(data_map, states, projection_horizon): #A data processing pipeline to format sequences into the right multistep shape
-    """
-    Split the sequences in the training data to train the decoder.
-    #so this is being used in the prepare dataloader multistep, within the trainer.py file 
-    #process_seq_data does a full sliding window over the time series, creating a lot more samples. It's used during training to teach the decoder/model how to forecast at all time steps
-    #while process_counterfactual_seq_test_data just cuts the trajectory once (at t=4) for each patient for testing a single scenario.
-
-    CODE ADAPTED FROM: https://github.com/ioanabica/Counterfactual-Recurrent-Network
-    """
-
-    outputs = data_map["outputs"]
-    sequence_lengths = data_map["sequence_lengths"]
-    active_entries = data_map["active_entries"]
-    current_treatments = data_map["current_treatments"]
-    previous_treatments = data_map["previous_treatments"]
-    current_covariates = data_map["current_covariates"]
-
-    print(active_entries.shape)
-
-    num_patients, num_time_steps, num_features = outputs.shape
-
-    num_seq2seq_rows = num_patients * num_time_steps #Overestimates the number of rows for initialization — safe and conservative.
-
-    #Pre-allocates arrays to hold sliding-window sequences for decoder training.
-    seq2seq_state_inits = np.zeros((num_seq2seq_rows, states.shape[-1])) 
-    seq2seq_previous_treatments = np.zeros((num_seq2seq_rows, projection_horizon, previous_treatments.shape[-1]),)
-    seq2seq_current_treatments = np.zeros((num_seq2seq_rows, projection_horizon, current_treatments.shape[-1]),)
-    seq2seq_current_covariates = np.zeros((num_seq2seq_rows, projection_horizon, current_covariates.shape[-1]),)
-    seq2seq_outputs = np.zeros((num_seq2seq_rows, projection_horizon, outputs.shape[-1]),)
-    seq2seq_active_entries = np.zeros((num_seq2seq_rows, projection_horizon, active_entries.shape[-1]))
-    seq2seq_sequence_lengths = np.zeros(num_seq2seq_rows)
-    
-    total_seq2seq_rows = 0  # we use this to shorten any trajectories later
-
-    #It creates a new sequence prediction task of up to projection_horizon steps.
-
-    for i in range(num_patients): #for each patient 
-
-        sequence_length = int(sequence_lengths[i])
-        print(sequence_length)
-        max_z = states.shape[1]
-
-        for t in range(1, sequence_length):  # shift outputs back by 1 - and for each valid starting point (0-20)
-           
-            seq2seq_state_inits[total_seq2seq_rows, :] = states[i, :]  # The decoder is initialized with the latent state for the entire sequence (from Neural CDE encoder).
-
-            #Even though you're sliding in time, you're always using the same z_hat per patient — this could be refined (e.g., with per-timepoint encoding), but is totally valid.
-
-            max_projection = min(projection_horizon, sequence_length - t) #Makes sure we don't go beyond the end of the time series.
-            seq2seq_active_entries[total_seq2seq_rows, :max_projection, :] = active_entries[i, t : t + max_projection, :]
-            seq2seq_previous_treatments[total_seq2seq_rows, :max_projection, :] = previous_treatments[i, t - 1 : t + max_projection - 1, :]
-            seq2seq_current_treatments[total_seq2seq_rows, :max_projection, :] = current_treatments[i, t : t + max_projection, :]
-            seq2seq_outputs[total_seq2seq_rows, :max_projection, :] = outputs[i, t : t + max_projection, :] #This is the key: target outputs for the next max_projection time steps, starting at time t.
-            seq2seq_sequence_lengths[total_seq2seq_rows] = max_projection
-            seq2seq_current_covariates[total_seq2seq_rows, :max_projection, :] = current_covariates[i, t : t + max_projection, :]
-
-            total_seq2seq_rows += 1
-
-    # Filter everything shorter
-    seq2seq_state_inits = seq2seq_state_inits[:total_seq2seq_rows]
-    seq2seq_previous_treatments = seq2seq_previous_treatments[:total_seq2seq_rows, :, :]
-    seq2seq_current_treatments = seq2seq_current_treatments[:total_seq2seq_rows, :, :]
-    seq2seq_current_covariates = seq2seq_current_covariates[:total_seq2seq_rows, :, :]
-    seq2seq_outputs = seq2seq_outputs[:total_seq2seq_rows, :, :]
-    seq2seq_active_entries = seq2seq_active_entries[:total_seq2seq_rows, :, :]
-    seq2seq_sequence_lengths = seq2seq_sequence_lengths[:total_seq2seq_rows]
-
-    # Package outputs - The final output is a dictionary of arrays, ready to be converted into PyTorch tensors later (as is done in prepare_dataloader_multistep()).
-    seq2seq_data_map = {
-        "init_state": seq2seq_state_inits,
-        "previous_treatments": seq2seq_previous_treatments,
-        "current_treatments": seq2seq_current_treatments,
-        "current_covariates": seq2seq_current_covariates,
-        "outputs": seq2seq_outputs,
-        "sequence_lengths": seq2seq_sequence_lengths,
-        "active_entries": seq2seq_active_entries,
-        "unscaled_outputs": seq2seq_outputs * data_map["output_stds"]
-        + data_map["output_means"],
-        "output_means": data_map["output_means"],
-        "output_stds": data_map["output_stds"],
-    }
-
-    return seq2seq_data_map
-
-
-def data_to_torch_tensor(data, sample_prop=1, time_concat=-1):
-    """
-    Returns torch tensors of data -- one step ahead
-
-    Args:
-    data (numpy array): np array containing data
-    sample_prop (int): proportion of samples
-
-    Returns:
-    data_X (torch tensor): containing covariates
-    data_A (torch tensor): containing previous_treatments
-    data_y (torch tensor): containing outcomes
-    data_tr (torch tensor): containing current treatments
-    """
-
-    # extract data
-    data_x = data["current_covariates"] #Starts with current_covariates (X features) and concatenates time-related covariates along the feature dimension. This becomes your full input feature set.
-
-    data_x = np.concatenate(
-        (data["current_covariates"], data["time_covariates"]),#changed from time_covariates to intensity
-        axis=2,
-    )
-
-    # np.concatenate((training_processed['current_covariates'][:,0:n,:], training_processed['previous_treatments']), axis=2)
-    data_a = data["previous_treatments"] #Extracts past treatments (A features).
-
-    data_time = None  # Because we include time in data_x
-
-    data_y = np.concatenate((data["outputs"], data["active_entries"]), axis=2) #Combines the actual labels (outputs) with a mask (active_entries) that probably tells you which entries are valid/missing.
-    data_tr = data["current_treatments"] #Gets current treatment assignments — likely used for learning treatment/action policies.
-
-    treated_indices, untreated_indices = get_treatment_indices(tr=data_tr) #Splits the dataset based on whether the treatment was applied or not (useful for evaluation or causal learning).
-
-    total_samples = data_x.shape[0]
-
-    # get samples based on sampling proportion
-    sample_prop = 1
-    samples = int(total_samples * sample_prop)
-
-    # numpy to torch tensor
-    sample_idxs = random.sample(range(0, total_samples), samples) #Randomly samples data points if you're using only a proportion of the dataset.
-
-    data_X = torch.from_numpy(data_x[:, 0:20, :time_concat])
-    data_A = torch.from_numpy(data_a[:, :, :])
-    data_Time = None  # Because we include time in data_x
-    data_y = torch.from_numpy(data_y[:, :, :])
-    data_tr = torch.from_numpy(data_tr[:, :, :])
-
+    """Compatibility helper if main code stores datasets in a pickle_map."""
     return (
-        data_X,
-        data_A,
-        data_Time,
-        data_y,
-        data_tr,
-        treated_indices,
-        untreated_indices,
+        pickle_map["training_data"],
+        pickle_map["validation_data"],
+        pickle_map["test_data"],
     )
-
-
-def data_to_torch_tensor_multistep(data, sample_prop=1, max_horizon=5):
-    """
-    Returns torch tensors of data --- multistep prediction
-
-    Args:
-    data (numpy array): np array containing data
-    sample_prop (int): proportion of samples
-
-    Returns:
-    data_X (torch tensor): containing covariates
-    data_A (torch tensor): containing previous_treatments
-    data_y (torch tensor): containing outcomes
-    data_tr (torch tensor): containing current treatments
-    """
-    # "current_covariates"
-    # extract data
-    data_x = data["init_state"]
-
-    data_a = data["previous_treatments"]
-
-    data_y = np.concatenate((data["outputs"], data["active_entries"]), axis=2)
-    data_tr = data["current_treatments"]
-
-    total_samples = data_x.shape[0]
-
-    # get samples based on sampling proportion
-    sample_prop = 1
-    samples = int(total_samples * sample_prop)
-
-    sample_idxs = random.sample(range(0, total_samples), samples)
-
-    data_X = (
-        torch.from_numpy(data_x[sample_idxs, :]).unsqueeze(1).repeat(1, max_horizon, 1)
-    )
-    data_A = torch.from_numpy(data_a[sample_idxs, :, :])
-    data_Time = None
-    data_y = torch.from_numpy(data_y[sample_idxs, :, :])
-    data_tr = torch.from_numpy(data_tr[sample_idxs, :, :])
-
-    return data_X, data_A, data_Time, data_y, data_tr
-
-
-def write_to_file(contents, filename):
-    """
-    It takes in a variable called contents and a variable called filename, and
-    then writes the contents to a pickle file with the name filename.
-
-    contents (str): the data to be written to the file
-    filename (str): the name of the file to write to
-    """
-    # write contents to pickle file
-
-    with open(filename, "wb") as handle:
-        pickle.dump(contents, handle)
-
-
-def read_from_file(filename):
-    """
-    It loads the file from pickle.
-
-    filename (str): the name of the file to read from
-    return: A list of dictionaries.
-    """
-    # load file from pickle
-
-    return pickle.load(open(filename, "rb"))
