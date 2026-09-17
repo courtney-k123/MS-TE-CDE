@@ -1,5 +1,5 @@
 # MS-TE-CDE
-Treatment Effect Neural Controlled Differential Equation (TE-CDE) was adapted from (Seedat et al., 2022) for use in multiple sclerosis. TE-CDE was chosen because of its handling irregularly spaced longitudinal data with treatment-confounder feedback. <img width="468" height="41" alt="image" src="https://github.com/user-attachments/assets/c64886ef-dd20-4a0c-8845-b9af1635fb49" />
+Treatment Effect Neural Controlled Differential Equation (TE-CDE) was adapted from (Seedat et al., 2022) for use in multiple sclerosis. TE-CDE was chosen because of its handling irregularly spaced longitudinal data with treatment-confounder feedback.
 
 <img width="427" height="217" alt="image" src="https://github.com/user-attachments/assets/0cea80ec-c35e-475d-a43f-76c0828809a7" />
 
